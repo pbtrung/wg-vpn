@@ -74,6 +74,15 @@ pub fn is_canonical(s: &str) -> bool {
     decode(s).is_ok() && matches!(s.as_bytes().first(), Some(b'0') | Some(b'1'))
 }
 
+/// A fresh random 52-character value from 32 CSPRNG bytes — used for
+/// generation IDs and pointer revisions alike (wg-server.md §10), which
+/// share this exact encoding and randomness source.
+pub fn random_id() -> String {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).expect("OS CSPRNG must be available");
+    encode(&bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

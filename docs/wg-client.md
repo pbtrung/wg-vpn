@@ -228,10 +228,10 @@ sequenceDiagram
     participant W as wg-quick / kernel
 
     C->>C: resolve hostname
-    C->>C: acquire interface lock; recover pending local apply<br/>restore last good config on boot if needed
+    C->>C: acquire interface lock, recover pending local apply<br/>restore last good config on boot if needed
     C->>S: GetObject current.json
     C->>S: GetObject nodes/{hostname}/{current.id}.conf
-    Note over C,S: Verify digest; on a retired generation's 404,<br/>rediscover current with a bounded retry budget
+    Note over C,S: Verify digest, on a retired generation's 404,<br/>rediscover current with a bounded retry budget
     alt discovery or download failed
         C->>C: log error, exit non-zero
         Note over C,W: existing interface, if any, is left untouched
@@ -245,7 +245,7 @@ sequenceDiagram
             alt unchanged, interface matches, no pending apply, and not --force
                 C->>C: no-op, exit 0
             else changed, interface needs repair, or --force
-                C->>C: stage file with mode 0600; fsync<br/>record pending apply and preserve last good config
+                C->>C: stage file with mode 0600, fsync<br/>record pending apply and preserve last good config
                 C->>W: check managed WireGuard interface
                 opt interface currently up
                     C->>W: wg-quick down <conf_path> (old config still installed)

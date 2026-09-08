@@ -753,6 +753,57 @@ mod tests {
         assert!(report.cleanup_error.is_none());
     }
 
+    /// M5 "real transport races": simulate two overlapping writers by
+    /// committing a pointer change out from under `commit_pointer`'s
+    /// baseline, then verifying it correctly reports a conflict instead
+    /// of silently overwriting the other writer's publication.
+    #[tokio::test]
+    async fn commit_pointer_detects_a_concurrent_writer() {
+        let storage = MockStorage::new();
+        let initial = CurrentJson::empty(base32::random_id());
+        let body = serde_json::to_vec(&initial).unwrap();
+        let PutOutcome::Written(etag) = storage
+            .put_if_absent(CURRENT_JSON_KEY, body, "application/json")
+            .await
+            .unwrap()
+        else {
+            panic!("expected the initial pointer write to succeed");
+        };
+
+        // A concurrent writer commits using the same (still current)
+        // baseline, winning the race.
+        let other = CurrentJson {
+            revision: base32::random_id(),
+            ..initial.clone()
+        };
+        storage
+            .put_if_match(
+                CURRENT_JSON_KEY,
+                serde_json::to_vec(&other).unwrap(),
+                "application/json",
+                &etag,
+            )
+            .await
+            .unwrap();
+
+        // Our own commit, still holding the original (now stale) baseline
+        // and ETag, must detect a real conflict rather than clobbering
+        // the other writer's publication.
+        let mine = CurrentJson {
+            revision: base32::random_id(),
+            ..initial.clone()
+        };
+        let err = commit_pointer(&storage, &initial, &etag, &mine)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ApplyError::PointerConflict));
+
+        // The other writer's publication must still be intact.
+        let observed = storage.get_object(CURRENT_JSON_KEY).await.unwrap().unwrap();
+        let observed_doc: CurrentJson = serde_json::from_slice(&observed.bytes).unwrap();
+        assert_eq!(observed_doc.revision, other.revision);
+    }
+
     #[tokio::test]
     async fn dry_run_makes_no_storage_writes() {
         let storage = MockStorage::new();

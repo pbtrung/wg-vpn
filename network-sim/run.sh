@@ -99,6 +99,35 @@ else
     pass "mobile-01 -> workstation-01 correctly unreachable"
 fi
 
+# M5 chaos scenario: publish a real config change, then SIGKILL
+# wg-client partway through applying it on a real container, and verify
+# the node recovers to a working state on the next scheduled pass rather
+# than being left with a broken or half-installed tunnel.
+log "chaos: publishing a config change (rotate master-us)"
+docker compose run --rm server apply --config /etc/wg-server/topology.json --rotate master-us >/dev/null
+
+log "chaos: killing wg-client on workstation-01 mid-sync"
+docker compose exec -T workstation-01 sh -c \
+    'wg-client sync --config /etc/wg-client/config.json --once --hostname workstation-01 & pid=$!; sleep 0.05; kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; true'
+
+log "chaos: recovery pass"
+if docker compose exec -T workstation-01 wg-client sync --config /etc/wg-client/config.json --once --hostname workstation-01; then
+    pass "recovery pass completed without error"
+else
+    fail "recovery pass reported an error (see logs above)"
+fi
+# master-us's own interface also needs the rotated key it just published;
+# only workstation-01's crash/recovery was under test above.
+sync_node master-us
+
+docker compose exec -T workstation-01 ping -c 3 -W 2 10.10.0.1 >/dev/null 2>&1 || true
+sleep 1
+if ping_ok master-us 10.10.0.100; then
+    pass "tunnel still works after the killed transaction and recovery"
+else
+    fail "tunnel broken after the killed transaction and recovery"
+fi
+
 if [ "$FAILED" = "0" ]; then
     log "ALL ASSERTIONS PASSED"
 else

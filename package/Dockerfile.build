@@ -32,15 +32,25 @@ ARG WG_VPN_REF=main
 WORKDIR /build
 RUN git clone --depth 1 --branch "$WG_VPN_REF" "$WG_VPN_REPO" .
 
-# x86_64: native build.
-RUN cargo build --release --locked -p wg-server -p wg-client
+# x86_64: native build. Strip here rather than relying on PKGBUILD's
+# packaging step -- these binaries ship as-is (PKGBUILD sets
+# options=('!strip' '!debug'), since there's no debuginfo to correlate
+# against a prebuilt binary anyway), so this is the only place that
+# would ever strip them.
+RUN cargo build --release --locked -p wg-server -p wg-client \
+    && strip target/release/wg-server target/release/wg-client
 
 # aarch64: cross-compile, pointing cargo at the cross gcc as both the
-# linker and (via CC_<target>) the cc used by any build script.
+# linker and (via CC_<target>) the cc used by any build script. Strip
+# with the cross binutils' own strip -- the host's plain `strip`
+# doesn't understand an aarch64 ELF.
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
 RUN cargo build --release --locked --target aarch64-unknown-linux-gnu \
-    -p wg-server -p wg-client
+    -p wg-server -p wg-client \
+    && aarch64-linux-gnu-strip \
+        target/aarch64-unknown-linux-gnu/release/wg-server \
+        target/aarch64-unknown-linux-gnu/release/wg-client
 
 FROM scratch AS dist
 COPY --from=builder /build/target/release/wg-server /x86_64/wg-server

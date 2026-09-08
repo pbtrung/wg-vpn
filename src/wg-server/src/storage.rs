@@ -21,9 +21,6 @@ pub enum StorageError {
     Put(String, String),
     #[error("ListObjectsV2 (prefix {0}) failed: {1}")]
     List(String, String),
-    // Consumed by M2's retention cleanup (docs/milestones.md), not yet
-    // in M1's apply path.
-    #[allow(dead_code)]
     #[error("DeleteObject {0} failed: {1}")]
     Delete(String, String),
     #[error("object {0} has no ETag in the response")]
@@ -72,8 +69,14 @@ pub trait Storage {
     /// List every object key under `prefix`.
     async fn list_all(&self, prefix: &str) -> Result<Vec<String>, StorageError>;
 
-    // Consumed by M2's retention cleanup, not yet in M1's apply path.
-    #[allow(dead_code)]
+    /// List every object key under `prefix` along with its LastModified
+    /// time — used by retention cleanup's minimum-age grace period
+    /// (wg-server.md §10 "Retention").
+    async fn list_all_with_last_modified(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, std::time::SystemTime)>, StorageError>;
+
     async fn delete_object(&self, key: &str) -> Result<(), StorageError>;
 }
 
@@ -241,6 +244,38 @@ impl Storage for R2Client {
         Ok(keys)
     }
 
+    async fn list_all_with_last_modified(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, std::time::SystemTime)>, StorageError> {
+        let mut out = Vec::new();
+        let mut continuation_token = None;
+        loop {
+            let mut req = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(prefix);
+            if let Some(token) = &continuation_token {
+                req = req.continuation_token(token);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| StorageError::List(prefix.to_string(), e.to_string()))?;
+            for obj in resp.contents() {
+                if let (Some(k), Some(dt)) = (obj.key(), obj.last_modified()) {
+                    out.push((k.to_string(), datetime_to_system_time(dt)));
+                }
+            }
+            match resp.next_continuation_token() {
+                Some(t) => continuation_token = Some(t.to_string()),
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     async fn delete_object(&self, key: &str) -> Result<(), StorageError> {
         self.client
             .delete_object()
@@ -251,6 +286,11 @@ impl Storage for R2Client {
             .map_err(|e| StorageError::Delete(key.to_string(), e.to_string()))?;
         Ok(())
     }
+}
+
+fn datetime_to_system_time(dt: &aws_smithy_types::DateTime) -> std::time::SystemTime {
+    std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::new(dt.secs().max(0) as u64, dt.subsec_nanos())
 }
 
 fn is_not_found<E>(
@@ -278,10 +318,12 @@ pub mod mock {
     use super::{FetchedObject, PutOutcome, Storage, StorageError};
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::time::{Duration, SystemTime};
 
     struct Entry {
         bytes: Vec<u8>,
         etag: String,
+        created_at: SystemTime,
     }
 
     #[derive(Default)]
@@ -307,6 +349,15 @@ pub mod mock {
 
         pub fn object_count(&self) -> usize {
             self.objects.lock().unwrap().len()
+        }
+
+        /// Test-only: move `key`'s recorded creation time `age` further
+        /// into the past, to exercise the retention grace period without
+        /// a real sleep.
+        pub fn backdate(&self, key: &str, age: Duration) {
+            if let Some(entry) = self.objects.lock().unwrap().get_mut(key) {
+                entry.created_at -= age;
+            }
         }
     }
 
@@ -349,6 +400,7 @@ pub mod mock {
                 Entry {
                     bytes: body,
                     etag: etag.clone(),
+                    created_at: SystemTime::now(),
                 },
             );
             Ok(PutOutcome::Written(etag))
@@ -382,6 +434,7 @@ pub mod mock {
                 Entry {
                     bytes: body,
                     etag: new_etag.clone(),
+                    created_at: SystemTime::now(),
                 },
             );
             Ok(PutOutcome::Written(new_etag))
@@ -395,6 +448,20 @@ pub mod mock {
                 .keys()
                 .filter(|k| k.starts_with(prefix))
                 .cloned()
+                .collect())
+        }
+
+        async fn list_all_with_last_modified(
+            &self,
+            prefix: &str,
+        ) -> Result<Vec<(String, SystemTime)>, StorageError> {
+            Ok(self
+                .objects
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(k, _)| k.starts_with(prefix))
+                .map(|(k, e)| (k.clone(), e.created_at))
                 .collect())
         }
 

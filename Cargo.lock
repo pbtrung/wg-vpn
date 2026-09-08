@@ -2435,6 +2435,7 @@ dependencies = [
  "anyhow",
  "aws-sdk-s3",
  "aws-smithy-runtime-api",
+ "aws-smithy-types",
  "clap",
  "serde",
  "serde_json",

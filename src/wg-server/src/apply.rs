@@ -1,8 +1,6 @@
 //! The `apply` algorithm (wg-server.md §8 "apply algorithm", §10
-//! "Storage layout and generation discovery" / "Publication commit").
-//! M1 scope only: init, reuse, complete immutable generations,
-//! conditional commit. Rotation (`--rotate`) and retention cleanup are
-//! M2 and are not implemented here yet.
+//! "Storage layout and generation discovery" / "Publication commit"),
+//! including M2's rotation (`--rotate`) and retention cleanup.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,10 +11,11 @@ use wg_common::render::{ParsedConfig, ResolvedKeys, render_node_config};
 use wg_common::topology::{TopologyConfig, ValidatedTopology, ValidationError};
 use wg_common::{base32, discovery, keys, render};
 
+use crate::retention;
 use crate::storage::{PutOutcome, Storage, StorageError};
 
-const CURRENT_JSON_KEY: &str = "current.json";
-const NODES_PREFIX: &str = "nodes/";
+pub(crate) const CURRENT_JSON_KEY: &str = "current.json";
+pub(crate) const NODES_PREFIX: &str = "nodes/";
 const MAX_POINTER_RETRIES: u32 = 5;
 
 #[derive(Debug, Error)]
@@ -65,10 +64,24 @@ pub enum ApplyError {
     PointerCommitUnknown,
     #[error("exceeded {MAX_POINTER_RETRIES} attempts reconciling the pointer commit")]
     PointerRetriesExhausted,
+    #[error("--rotate names {0:?}, which is not in the current topology config")]
+    UnknownRotateHostname(String),
 }
 
 pub struct ApplyOptions {
     pub dry_run: bool,
+    pub rotate: RotateSelection,
+    pub grace_period: std::time::Duration,
+}
+
+impl Default for ApplyOptions {
+    fn default() -> Self {
+        ApplyOptions {
+            dry_run: false,
+            rotate: RotateSelection::None,
+            grace_period: crate::retention::DEFAULT_GRACE_PERIOD,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -79,6 +92,12 @@ pub struct ApplyReport {
     pub published: bool,
     pub new_generation_id: Option<String>,
     pub uploaded_hostnames: Vec<String>,
+    pub cleanup_deleted: Vec<String>,
+    pub cleanup_skipped_within_grace: Vec<String>,
+    /// Set when cleanup itself failed. Per wg-server.md §11 this does not
+    /// invalidate the publication (`published`/`new_generation_id` above
+    /// remain valid), but the caller should still exit non-zero.
+    pub cleanup_error: Option<String>,
 }
 
 fn digest_of(bytes: &[u8]) -> String {
@@ -182,9 +201,30 @@ struct KeyResolution {
     freshly_keyed: Vec<String>,
 }
 
+/// Which nodes `apply --rotate` forces a fresh keypair for, ignoring any
+/// currently-published key (wg-server.md §4/§8).
+#[derive(Debug, Clone, Default)]
+pub enum RotateSelection {
+    #[default]
+    None,
+    All,
+    Named(BTreeSet<String>),
+}
+
+impl RotateSelection {
+    fn is_rotated(&self, hostname: &str) -> bool {
+        match self {
+            RotateSelection::None => false,
+            RotateSelection::All => true,
+            RotateSelection::Named(set) => set.contains(hostname),
+        }
+    }
+}
+
 fn resolve_keys(
     topo: &ValidatedTopology,
     old_configs: &BTreeMap<String, ParsedConfig>,
+    rotate: &RotateSelection,
 ) -> Result<KeyResolution, ApplyError> {
     let mut resolved = ResolvedKeys::default();
     let mut reused = Vec::new();
@@ -192,7 +232,12 @@ fn resolve_keys(
     let mut is_fresh: BTreeMap<String, bool> = BTreeMap::new();
 
     for node in &topo.nodes {
-        if let Some(old) = old_configs.get(&node.hostname) {
+        let existing = if rotate.is_rotated(&node.hostname) {
+            None
+        } else {
+            old_configs.get(&node.hostname)
+        };
+        if let Some(old) = existing {
             let kp = keys::Keypair::from_private_key_base64(&old.interface.private_key).map_err(
                 |source| ApplyError::BadStoredKey {
                     hostname: node.hostname.clone(),
@@ -267,6 +312,52 @@ fn resolve_keys(
     })
 }
 
+/// Conditionally replace `current.json` with `intended`, reconciling an
+/// ambiguous outcome per wg-server.md §10 "Publication commit": if a
+/// `PreconditionFailed` turns out to already hold our intended bytes (a
+/// lost response from our own write), treat it as success; if the
+/// observed pointer still matches `baseline`'s revision, retry against
+/// its fresh ETag; otherwise, another writer won — report a conflict.
+async fn commit_pointer<S: Storage>(
+    storage: &S,
+    baseline: &CurrentJson,
+    baseline_etag: &str,
+    intended: &CurrentJson,
+) -> Result<(), ApplyError> {
+    let intended_bytes = serde_json::to_vec(intended).expect("CurrentJson always serializes");
+    let mut etag = baseline_etag.to_string();
+    for _ in 0..MAX_POINTER_RETRIES {
+        match storage
+            .put_if_match(
+                CURRENT_JSON_KEY,
+                intended_bytes.clone(),
+                "application/json",
+                &etag,
+            )
+            .await?
+        {
+            PutOutcome::Written(_) => return Ok(()),
+            PutOutcome::PreconditionFailed => {
+                let obj = storage
+                    .get_object(CURRENT_JSON_KEY)
+                    .await?
+                    .ok_or(ApplyError::PointerCommitUnknown)?;
+                if obj.bytes == intended_bytes {
+                    return Ok(()); // our own write landed; a prior response was lost
+                }
+                let observed =
+                    discovery::parse(std::str::from_utf8(&obj.bytes).unwrap_or_default())?;
+                if observed.revision == baseline.revision {
+                    etag = obj.etag;
+                    continue;
+                }
+                return Err(ApplyError::PointerConflict);
+            }
+        }
+    }
+    Err(ApplyError::PointerRetriesExhausted)
+}
+
 pub async fn apply<S: Storage>(
     storage: &S,
     config: &TopologyConfig,
@@ -276,6 +367,14 @@ pub async fn apply<S: Storage>(
     let desired_hostnames: BTreeSet<String> =
         topo.nodes.iter().map(|n| n.hostname.clone()).collect();
 
+    if let RotateSelection::Named(names) = &opts.rotate {
+        for name in names {
+            if !desired_hostnames.contains(name) {
+                return Err(ApplyError::UnknownRotateHostname(name.clone()));
+            }
+        }
+    }
+
     let (pointer, pointer_etag) = fetch_current_pointer(storage, opts.dry_run).await?;
     let old_configs = fetch_reusable_configs(storage, &pointer.current, &desired_hostnames).await?;
 
@@ -283,7 +382,7 @@ pub async fn apply<S: Storage>(
         resolved,
         reused,
         freshly_keyed,
-    } = resolve_keys(&topo, &old_configs)?;
+    } = resolve_keys(&topo, &old_configs, &opts.rotate)?;
 
     let mut rendered: BTreeMap<String, Vec<u8>> = BTreeMap::new();
     let mut digests: BTreeMap<String, String> = BTreeMap::new();
@@ -309,98 +408,81 @@ pub async fn apply<S: Storage>(
         published: false,
         new_generation_id: None,
         uploaded_hostnames: Vec::new(),
+        cleanup_deleted: Vec::new(),
+        cleanup_skipped_within_grace: Vec::new(),
+        cleanup_error: None,
     };
 
-    if unchanged {
-        return Ok(report);
-    }
-
-    let new_id = base32::random_id();
-    report.new_generation_id = Some(new_id.clone());
-
-    if opts.dry_run {
-        report.uploaded_hostnames = desired_hostnames.into_iter().collect();
-        return Ok(report);
-    }
-
-    for hostname in &desired_hostnames {
-        let key = node_object_key(hostname, &new_id);
-        let body = rendered[hostname].clone();
-        match storage
-            .put_if_absent(&key, body.clone(), "text/plain; charset=utf-8")
-            .await?
-        {
-            PutOutcome::Written(_) => {
-                report.uploaded_hostnames.push(hostname.clone());
-            }
-            PutOutcome::PreconditionFailed => {
-                let existing = storage.get_object(&key).await?.ok_or_else(|| {
-                    ApplyError::GenerationIdCollision {
-                        hostname: hostname.clone(),
-                    }
-                })?;
-                if existing.bytes != body {
-                    return Err(ApplyError::GenerationIdCollision {
-                        hostname: hostname.clone(),
-                    });
-                }
-                report.uploaded_hostnames.push(hostname.clone());
-            }
+    let final_pointer = if unchanged {
+        let refreshed = CurrentJson {
+            schema_version: discovery::SCHEMA_VERSION,
+            revision: base32::random_id(),
+            current: pointer.current.clone(),
+            previous: pointer.previous.clone(),
+        };
+        if !opts.dry_run {
+            commit_pointer(storage, &pointer, &pointer_etag, &refreshed).await?;
         }
-    }
+        refreshed
+    } else {
+        let new_id = base32::random_id();
+        report.new_generation_id = Some(new_id.clone());
+        let new_pointer = CurrentJson {
+            schema_version: discovery::SCHEMA_VERSION,
+            revision: base32::random_id(),
+            current: Some(GenerationEntry {
+                id: new_id.clone(),
+                nodes: digests,
+            }),
+            previous: pointer.current.clone(),
+        };
 
-    let new_pointer = CurrentJson {
-        schema_version: discovery::SCHEMA_VERSION,
-        revision: base32::random_id(),
-        current: Some(GenerationEntry {
-            id: new_id.clone(),
-            nodes: digests,
-        }),
-        previous: pointer.current.clone(),
-    };
-    let intended_bytes = serde_json::to_vec(&new_pointer).expect("CurrentJson always serializes");
-
-    let mut baseline_etag = pointer_etag;
-    for _ in 0..MAX_POINTER_RETRIES {
-        match storage
-            .put_if_match(
-                CURRENT_JSON_KEY,
-                intended_bytes.clone(),
-                "application/json",
-                &baseline_etag,
-            )
-            .await?
-        {
-            PutOutcome::Written(_) => {
-                report.published = true;
-                return Ok(report);
-            }
-            PutOutcome::PreconditionFailed => {
-                let obj = storage
-                    .get_object(CURRENT_JSON_KEY)
+        if opts.dry_run {
+            report.uploaded_hostnames = desired_hostnames.iter().cloned().collect();
+        } else {
+            for hostname in &desired_hostnames {
+                let key = node_object_key(hostname, &new_id);
+                let body = rendered[hostname].clone();
+                match storage
+                    .put_if_absent(&key, body.clone(), "text/plain; charset=utf-8")
                     .await?
-                    .ok_or(ApplyError::PointerCommitUnknown)?;
-                if obj.bytes == intended_bytes {
-                    // Our own write actually landed; a prior response was lost.
-                    report.published = true;
-                    return Ok(report);
+                {
+                    PutOutcome::Written(_) => {
+                        report.uploaded_hostnames.push(hostname.clone());
+                    }
+                    PutOutcome::PreconditionFailed => {
+                        let existing = storage.get_object(&key).await?.ok_or_else(|| {
+                            ApplyError::GenerationIdCollision {
+                                hostname: hostname.clone(),
+                            }
+                        })?;
+                        if existing.bytes != body {
+                            return Err(ApplyError::GenerationIdCollision {
+                                hostname: hostname.clone(),
+                            });
+                        }
+                        report.uploaded_hostnames.push(hostname.clone());
+                    }
                 }
-                let observed =
-                    discovery::parse(std::str::from_utf8(&obj.bytes).unwrap_or_default())?;
-                let observed_matches_baseline = observed.revision == {
-                    // Re-parse the baseline we started from for comparison.
-                    // (We only ever compare by content, since ETags are opaque.)
-                    pointer.revision.clone()
-                };
-                if observed_matches_baseline {
-                    baseline_etag = obj.etag;
-                    continue;
-                }
-                return Err(ApplyError::PointerConflict);
             }
+            commit_pointer(storage, &pointer, &pointer_etag, &new_pointer).await?;
+            report.published = true;
         }
+        new_pointer
+    };
+
+    // Retention cleanup runs on every pass, changed or not (wg-server.md
+    // §10 "Retention"). A cleanup failure doesn't invalidate a successful
+    // publication, but the caller (main.rs) still exits non-zero for it.
+    match retention::cleanup(storage, &final_pointer, opts.grace_period, opts.dry_run).await {
+        Ok(r) => {
+            report.cleanup_deleted = r.deleted;
+            report.cleanup_skipped_within_grace = r.skipped_within_grace;
+        }
+        Err(e) => report.cleanup_error = Some(e.to_string()),
     }
-    Err(ApplyError::PointerRetriesExhausted)
+
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -452,9 +534,16 @@ mod tests {
     async fn first_apply_on_empty_bucket_publishes_a_generation() {
         let storage = MockStorage::new();
         let cfg = two_master_two_spoke();
-        let report = apply(&storage, &cfg, &ApplyOptions { dry_run: false })
-            .await
-            .unwrap();
+        let report = apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(report.published);
         assert_eq!(report.freshly_keyed_hostnames.len(), 4);
         assert!(report.reused_hostnames.is_empty());
@@ -467,14 +556,28 @@ mod tests {
     async fn second_apply_with_unchanged_config_is_a_no_op() {
         let storage = MockStorage::new();
         let cfg = two_master_two_spoke();
-        apply(&storage, &cfg, &ApplyOptions { dry_run: false })
-            .await
-            .unwrap();
+        apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         let before = storage.object_count();
 
-        let report = apply(&storage, &cfg, &ApplyOptions { dry_run: false })
-            .await
-            .unwrap();
+        let report = apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(!report.published);
         assert_eq!(report.reused_hostnames.len(), 4);
         assert!(report.freshly_keyed_hostnames.is_empty());
@@ -482,17 +585,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_pass_still_refreshes_the_pointer_revision() {
+        let storage = MockStorage::new();
+        let cfg = two_master_two_spoke();
+        apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let first = storage.get_object(CURRENT_JSON_KEY).await.unwrap().unwrap();
+        let first_doc: CurrentJson = serde_json::from_slice(&first.bytes).unwrap();
+
+        apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let second = storage.get_object(CURRENT_JSON_KEY).await.unwrap().unwrap();
+        let second_doc: CurrentJson = serde_json::from_slice(&second.bytes).unwrap();
+
+        assert_eq!(first_doc.current, second_doc.current);
+        assert_ne!(first_doc.revision, second_doc.revision);
+        assert_ne!(first.etag, second.etag);
+    }
+
+    #[tokio::test]
     async fn adding_a_node_reuses_existing_keys_and_edges() {
         let storage = MockStorage::new();
         let mut cfg = two_master_two_spoke();
-        apply(&storage, &cfg, &ApplyOptions { dry_run: false })
-            .await
-            .unwrap();
+        apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
 
         cfg.nodes.push(node("mobile-02", "10.10.0.102", None));
-        let report = apply(&storage, &cfg, &ApplyOptions { dry_run: false })
-            .await
-            .unwrap();
+        let report = apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(report.published);
         assert_eq!(
             report.freshly_keyed_hostnames,
@@ -505,12 +657,116 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn rotate_named_only_affects_that_node_and_its_edges() {
+        let storage = MockStorage::new();
+        let cfg = two_master_two_spoke();
+        apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let opts = ApplyOptions {
+            dry_run: false,
+            rotate: RotateSelection::Named(["master-us".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        let report = apply(&storage, &cfg, &opts).await.unwrap();
+        assert!(report.published);
+        assert_eq!(
+            report.freshly_keyed_hostnames,
+            vec!["master-us".to_string()]
+        );
+        // master-eu, workstation-01, mobile-01 all keep their own identity
+        // keys, but every one of them has an edge to master-us and so
+        // gets a re-uploaded file (new PSK/peer public key), even though
+        // none of them is itself "freshly keyed".
+        assert_eq!(report.reused_hostnames.len(), 3);
+        assert_eq!(report.uploaded_hostnames.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn bare_rotate_regenerates_every_key() {
+        let storage = MockStorage::new();
+        let cfg = two_master_two_spoke();
+        apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let opts = ApplyOptions {
+            dry_run: false,
+            rotate: RotateSelection::All,
+            ..Default::default()
+        };
+        let report = apply(&storage, &cfg, &opts).await.unwrap();
+        assert!(report.published);
+        assert_eq!(report.freshly_keyed_hostnames.len(), 4);
+        assert!(report.reused_hostnames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rotate_rejects_unknown_hostname() {
+        let storage = MockStorage::new();
+        let cfg = two_master_two_spoke();
+        let opts = ApplyOptions {
+            dry_run: false,
+            rotate: RotateSelection::Named(["nonexistent".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        let err = apply(&storage, &cfg, &opts).await.unwrap_err();
+        assert!(matches!(err, ApplyError::UnknownRotateHostname(_)));
+    }
+
+    #[tokio::test]
+    async fn cleanup_removes_orphaned_generations_past_grace_period() {
+        let storage = MockStorage::new();
+        let cfg = two_master_two_spoke();
+        let opts = ApplyOptions {
+            grace_period: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+
+        apply(&storage, &cfg, &opts).await.unwrap(); // generation 1
+        let mut cfg2 = cfg.clone();
+        cfg2.nodes[0].wg_config.mtu = Some(1400); // force a change -> generation 2
+        apply(&storage, &cfg2, &opts).await.unwrap();
+        let mut cfg3 = cfg2.clone();
+        cfg3.nodes[0].wg_config.mtu = Some(1401); // generation 3
+        let report = apply(&storage, &cfg3, &opts).await.unwrap();
+
+        // Only current + previous generations' objects remain, plus
+        // current.json: (4 nodes * 2 generations) + 1.
+        assert_eq!(storage.object_count(), 4 * 2 + 1);
+        assert!(!report.cleanup_deleted.is_empty());
+        assert!(report.cleanup_error.is_none());
+    }
+
+    #[tokio::test]
     async fn dry_run_makes_no_storage_writes() {
         let storage = MockStorage::new();
         let cfg = two_master_two_spoke();
-        let report = apply(&storage, &cfg, &ApplyOptions { dry_run: true })
-            .await
-            .unwrap();
+        let report = apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
         assert!(!report.published);
         assert_eq!(report.uploaded_hostnames.len(), 4); // planned, not actually uploaded
         assert_eq!(storage.object_count(), 0);
@@ -521,7 +777,15 @@ mod tests {
         let storage = MockStorage::new();
         let cfg = two_master_two_spoke();
         *storage.fail_next_puts.lock().unwrap() = 1;
-        let result = apply(&storage, &cfg, &ApplyOptions { dry_run: false }).await;
+        let result = apply(
+            &storage,
+            &cfg,
+            &ApplyOptions {
+                dry_run: false,
+                ..Default::default()
+            },
+        )
+        .await;
         assert!(result.is_err());
         // Nothing should have been published: current.json was never
         // touched because the upload batch (which precedes any pointer
@@ -562,7 +826,7 @@ mod tests {
             render::parse_wg_quick(&eu_conf).unwrap(),
         );
 
-        let err = resolve_keys(&topo, &old_configs).unwrap_err();
+        let err = resolve_keys(&topo, &old_configs, &RotateSelection::None).unwrap_err();
         assert!(matches!(err, ApplyError::OneSidedEdge { .. }));
     }
 
@@ -597,7 +861,7 @@ mod tests {
             render::parse_wg_quick(&eu_conf).unwrap(),
         );
 
-        let err = resolve_keys(&topo, &old_configs).unwrap_err();
+        let err = resolve_keys(&topo, &old_configs, &RotateSelection::None).unwrap_err();
         assert!(matches!(err, ApplyError::ConflictingPsk { .. }));
     }
 }

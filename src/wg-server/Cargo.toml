@@ -17,3 +17,4 @@ tokio = { workspace = true }
 sha2 = { workspace = true }
 aws-sdk-s3 = { workspace = true }
 aws-smithy-runtime-api = "1"
+aws-smithy-types = "1"

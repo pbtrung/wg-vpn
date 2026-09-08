@@ -36,21 +36,22 @@ docker buildx build \
     --build-arg "WG_VPN_REF=${tag}" \
     "$package_dir"
 
-echo "==> renaming assets"
+echo "==> packaging both binaries into one tarball per arch"
 declare -A assets
 for arch in x86_64 aarch64; do
-    for bin in wg-server wg-client; do
-        src="${dist_dir}/${arch}/${bin}"
-        dest="${dist_dir}/${bin}-${arch}"
-        mv "$src" "$dest"
-        assets["${bin}_${arch}"]="$dest"
-    done
+    tarball="${dist_dir}/${arch}/wg-vpn-${arch}.tar.gz"
+    # Both binaries keep their plain names (wg-server/wg-client) inside
+    # the tarball -- only the archive's own filename carries the arch
+    # suffix -- so PKGBUILD's package() doesn't need to know $CARCH to
+    # find them after makepkg auto-extracts this source.
+    tar -czf "$tarball" -C "${dist_dir}/${arch}" wg-server wg-client
+    assets["$arch"]="$tarball"
 done
 
 echo "==> computing checksums"
 declare -A sums
-for key in "${!assets[@]}"; do
-    sums["$key"]="$(sha256sum "${assets[$key]}" | cut -d' ' -f1)"
+for arch in x86_64 aarch64; do
+    sums["$arch"]="$(sha256sum "${assets[$arch]}" | cut -d' ' -f1)"
 done
 
 echo "==> creating GitHub release ${tag}"
@@ -58,10 +59,8 @@ gh release create "$tag" \
     --repo pbtrung/wg-vpn \
     --title "$tag" \
     --generate-notes \
-    "${assets[wg-server_x86_64]}#wg-server-x86_64" \
-    "${assets[wg-client_x86_64]}#wg-client-x86_64" \
-    "${assets[wg-server_aarch64]}#wg-server-aarch64" \
-    "${assets[wg-client_aarch64]}#wg-client-aarch64"
+    "${assets[x86_64]}" \
+    "${assets[aarch64]}"
 
 echo "==> updating package/PKGBUILD"
 license_sum="$(sha256sum "$repo_root/LICENSE" | cut -d' ' -f1)"
@@ -69,10 +68,8 @@ pkgbuild="$package_dir/PKGBUILD"
 sed -i \
     -e "s/^pkgver=.*/pkgver=${version}/" \
     -e "s/^pkgrel=.*/pkgrel=1/" \
-    -e "s/REPLACE_WG_SERVER_X86_64/${sums[wg-server_x86_64]}/" \
-    -e "s/REPLACE_WG_CLIENT_X86_64/${sums[wg-client_x86_64]}/" \
-    -e "s/REPLACE_WG_SERVER_AARCH64/${sums[wg-server_aarch64]}/" \
-    -e "s/REPLACE_WG_CLIENT_AARCH64/${sums[wg-client_aarch64]}/" \
+    -e "s/REPLACE_WG_VPN_X86_64/${sums[x86_64]}/" \
+    -e "s/REPLACE_WG_VPN_AARCH64/${sums[aarch64]}/" \
     -e "s/REPLACE_LICENSE/${license_sum}/" \
     "$pkgbuild"
 

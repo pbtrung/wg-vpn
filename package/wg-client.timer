@@ -5,6 +5,7 @@ Documentation=https://github.com/pbtrung/wg-vpn
 [Timer]
 # 00:30 UTC: half an hour after wg-server's daily 00:00 UTC apply
 # (docs/wg-server.md §10's worked example uses this same offset).
+OnBootSec=5s
 OnCalendar=*-*-* 00:30:00 UTC
 Persistent=true
 RandomizedDelaySec=10m

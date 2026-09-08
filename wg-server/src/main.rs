@@ -43,6 +43,7 @@ enum Command {
         /// period. Cleanup always runs on every apply; this only removes
         /// the delay, so use it when you know no concurrent apply is in
         /// flight (e.g. interactive/manual use) rather than routinely.
+        /// Implied automatically by --rotate (see resolve_grace_period).
         #[arg(long)]
         prune: bool,
     },
@@ -90,6 +91,22 @@ fn parse_rotate(raw: Vec<String>) -> anyhow::Result<apply::RotateSelection> {
         return Ok(apply::RotateSelection::All);
     }
     Ok(apply::RotateSelection::Named(raw.into_iter().collect()))
+}
+
+/// `--prune` always forces immediate cleanup. `--rotate` (in either form)
+/// also forces it: rotation is always a deliberate, manual/operator-
+/// triggered action (docs/wg-server.md §2/§11 — the routine unattended
+/// cron invocation never passes `--rotate`), so there is no routine-job
+/// race for the grace period to protect against, and leaving a
+/// just-rotated (potentially compromised) key's old generation sitting
+/// around for 15 more minutes serves no purpose.
+fn resolve_grace_period(prune: bool, rotate: &apply::RotateSelection) -> std::time::Duration {
+    let rotating = !matches!(rotate, apply::RotateSelection::None);
+    if prune || rotating {
+        std::time::Duration::ZERO
+    } else {
+        apply::ApplyOptions::default().grace_period
+    }
 }
 
 /// RUST_LOG, if set, always wins; otherwise `-v`/`-vv`/`-vvv` selects
@@ -190,12 +207,8 @@ async fn main() -> ExitCode {
             let client = storage::R2Client::new(&cfg.r2_config);
             let opts = apply::ApplyOptions {
                 dry_run,
+                grace_period: resolve_grace_period(prune, &rotate),
                 rotate,
-                grace_period: if prune {
-                    std::time::Duration::ZERO
-                } else {
-                    apply::ApplyOptions::default().grace_period
-                },
             };
             match apply::apply(&client, &cfg, &opts).await {
                 Ok(report) => {
@@ -301,5 +314,40 @@ mod tests {
     #[test]
     fn mixing_bare_and_named_rotate_is_rejected() {
         assert!(parse_rotate(rotate_arg(&["--rotate", "--rotate", "a"])).is_err());
+    }
+
+    #[test]
+    fn no_flags_uses_the_default_grace_period() {
+        assert_eq!(
+            resolve_grace_period(false, &apply::RotateSelection::None),
+            apply::ApplyOptions::default().grace_period
+        );
+    }
+
+    #[test]
+    fn prune_alone_forces_immediate_cleanup() {
+        assert_eq!(
+            resolve_grace_period(true, &apply::RotateSelection::None),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn named_rotate_alone_forces_immediate_cleanup() {
+        assert_eq!(
+            resolve_grace_period(
+                false,
+                &apply::RotateSelection::Named(["a".to_string()].into_iter().collect())
+            ),
+            std::time::Duration::ZERO
+        );
+    }
+
+    #[test]
+    fn bare_rotate_alone_forces_immediate_cleanup() {
+        assert_eq!(
+            resolve_grace_period(false, &apply::RotateSelection::All),
+            std::time::Duration::ZERO
+        );
     }
 }

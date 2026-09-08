@@ -71,22 +71,32 @@ wg-vpn/
 ## 4. CLI
 
 ```
-wg-server apply    --config <path> [--rotate [<hostname>]]... [--dry-run]
+wg-server apply    --config <path> [--rotate [<hostname>]]... [--dry-run] [--prune]
 wg-server validate --config <path>
 ```
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--config <path>` | required | Path to the topology JSON (§5). |
-| `--rotate [<hostname>]` | none | Force a brand-new random key for the given node(s) instead of reusing what's currently published (§8). Two forms: `--rotate <hostname>` (repeatable) rotates only the named node(s); bare `--rotate` with no value rotates **every** node in `--config`. Passing both a bare `--rotate` and one or more `--rotate <hostname>` in the same invocation is a validation error — pick one form. |
+| `--config <path>` | required | Path to the topology JSON (§5). Falls back to the `WG_SERVER_CONFIG` environment variable if omitted. |
+| `--rotate [<hostname>]` | none | Force a brand-new random key for the given node(s) instead of reusing what's currently published (§8). Two forms: `--rotate <hostname>` (repeatable) rotates only the named node(s); bare `--rotate` with no value rotates **every** node in `--config`. Passing both a bare `--rotate` and one or more `--rotate <hostname>` in the same invocation is a validation error — pick one form. Implies `--prune` (see below). |
 | `--dry-run` | off | Read published state and compute the plan (key reuse/rotation, generation publication, retention cleanup); print a summary without secrets. Perform no bucket writes or deletes. |
+| `--prune` | off | Skip the retention grace period (§10) and delete anything outside `current`/`previous` immediately, instead of waiting the usual ~15 minutes. Automatically implied by `--rotate` in either form — see below. |
 
 `validate` only runs schema + topology validation (§5–6), no key handling, no network calls.
 
 The normal server command is `wg-server apply --config <path>`, on cloud
 cron expression `0 0 * * *` in UTC.
 It reuses existing keys; scheduling `apply` does not schedule rotation.
-Retention is automatic, so there is no separate `--prune` flag. Node
+Retention cleanup is automatic and always runs, but by default waits out
+the grace period described in §10. `--rotate` always forces immediate
+cleanup (as if `--prune` were also given): rotation is already a
+deliberate, manual/operator-triggered action, never part of the routine
+unattended cron invocation, so there is no routine-job race for the grace
+period to protect against, and there is no reason to leave a just-rotated
+generation's old (possibly compromised) key sitting around for the
+grace period. `--prune` is also available standalone (e.g. to force
+immediate cleanup of a plain, non-rotating `apply`, such as when
+testing/iterating and certain no concurrent apply is running). Node
 removal takes effect by omitting the node and its peer edges from the next
 generation, while the previous generation remains available under the
 same one-generation retention policy.

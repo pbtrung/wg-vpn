@@ -140,14 +140,16 @@ wg-server validate --config topology.json
 wg-server apply --config topology.json
 
 # Force a fresh key for one node (repeatable), or --rotate alone for
-# every node.
+# every node. --rotate always cleans up immediately (see below) since
+# it's already a deliberate, manual action -- never part of the routine
+# unattended cron invocation.
 wg-server apply --config topology.json --rotate workstation-01
 
 # Cleanup of old generations always runs automatically (keeping only the
 # current and one previous generation), but waits out a 15-minute grace
 # period by default. --prune forces it immediately -- useful when you're
-# testing/iterating and don't want to wait, or know no other apply is
-# running concurrently.
+# testing/iterating a plain (non-rotating) apply and don't want to wait,
+# or know no other apply is running concurrently.
 wg-server apply --config topology.json --prune
 
 # --config can be omitted if WG_SERVER_CONFIG is set instead -- this is

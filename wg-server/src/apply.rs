@@ -753,6 +753,53 @@ mod tests {
         assert!(report.cleanup_error.is_none());
     }
 
+    /// A `--rotate` apply publishes a new generation exactly like any
+    /// other change, so it must go through the same retention cleanup —
+    /// rotating should never leave more than current + previous around.
+    #[tokio::test]
+    async fn rotate_also_prunes_down_to_current_and_previous() {
+        let storage = MockStorage::new();
+        let cfg = two_master_two_spoke();
+        let opts = ApplyOptions {
+            grace_period: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+
+        apply(&storage, &cfg, &opts).await.unwrap(); // generation 1
+        let mut cfg2 = cfg.clone();
+        cfg2.nodes[0].wg_config.mtu = Some(1400); // generation 2
+        apply(&storage, &cfg2, &opts).await.unwrap();
+
+        let rotate_opts = ApplyOptions {
+            grace_period: std::time::Duration::ZERO,
+            rotate: RotateSelection::Named(["master-us".to_string()].into_iter().collect()),
+            ..Default::default()
+        };
+        let report = apply(&storage, &cfg2, &rotate_opts).await.unwrap(); // generation 3
+
+        assert!(report.published);
+        assert!(
+            !report.cleanup_deleted.is_empty(),
+            "generation 1 should have been pruned"
+        );
+        // Only current (gen 3) + previous (gen 2) remain, plus current.json.
+        assert_eq!(storage.object_count(), 4 * 2 + 1);
+
+        // Same check for a bare (rotate-everything) apply.
+        let bare_rotate_opts = ApplyOptions {
+            grace_period: std::time::Duration::ZERO,
+            rotate: RotateSelection::All,
+            ..Default::default()
+        };
+        let report2 = apply(&storage, &cfg2, &bare_rotate_opts).await.unwrap(); // generation 4
+        assert!(report2.published);
+        assert!(
+            !report2.cleanup_deleted.is_empty(),
+            "generation 2 should have been pruned"
+        );
+        assert_eq!(storage.object_count(), 4 * 2 + 1);
+    }
+
     /// M5 "real transport races": simulate two overlapping writers by
     /// committing a pointer change out from under `commit_pointer`'s
     /// baseline, then verifying it correctly reports a conflict instead

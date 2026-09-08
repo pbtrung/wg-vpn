@@ -6,7 +6,7 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/wg-client sync --config /etc/wg-client/config.json --once
+ExecStart=/usr/bin/wg-client sync --config /etc/wg-client/config.json --once -v
 
 # Needs root: wg-client shells out to wg-quick/wg/ip, which manage a
 # kernel network interface (README.md "Requirements"). Adjust

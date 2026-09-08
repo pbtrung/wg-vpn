@@ -9,13 +9,17 @@ Type=oneshot
 User=wg-server
 Group=wg-server
 Environment=WG_SERVER_CONFIG=/etc/wg-server/config.json
-ExecStart=/usr/bin/wg-server apply
+ExecStart=/usr/bin/wg-server apply --rotate -v
 
-# No key rotation by default: docs/wg-server.md says the routine
-# scheduled job must never pass --rotate (it can interrupt a live
-# tunnel until each node's wg-client next syncs). Rotate manually, e.g.:
-#   sudo -u wg-server WG_SERVER_CONFIG=/etc/wg-server/config.json \
-#     wg-server apply --rotate
+# Rotates every node's key on every scheduled run (--rotate implies
+# immediate cleanup, so no separate --prune is needed). This deviates
+# from docs/wg-server.md's general guidance that a routine scheduled
+# job should not rotate, since rotation can interrupt a live tunnel
+# until each node's wg-client next syncs -- the same deliberate
+# tradeoff docker/'s cron image makes; see its README's "Rotation on
+# every run" section for the operational consequences (every node must
+# sync often enough relative to this schedule, or it can permanently
+# miss a generation).
 
 # Sandboxing: this binary only reads the config file and talks to the
 # bucket over the network, so it needs neither root nor write access to

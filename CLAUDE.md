@@ -45,14 +45,16 @@ decision changes, update the doc in the same change, not as a follow-up.
   copy in a glibc-built binary; config path from `WG_SERVER_CONFIG`).
   Don't confuse the two directories.
 - `package/` — Arch Linux packaging: `PKGBUILD` installs both binaries
-  plus `systemd` service/timer units (`wg-server` at 00:00 UTC, no
-  rotation — the general docs-recommended schedule, unlike `docker/`'s
-  opinionated always-rotate entrypoint; `wg-client` at 00:30 UTC).
-  `Dockerfile.build` cross-builds both architectures (`x86_64`,
-  `aarch64`) from one amd64 host via Arch's official
-  `aarch64-linux-gnu-gcc` cross toolchain — no buildx/QEMU emulation, no
-  OpenSSL to cross-build (rustls). `release.sh` builds, uploads GitHub
-  release assets via `gh`, and rewrites `PKGBUILD`'s
+  plus `systemd` service/timer units (`wg-server` at 00:00 UTC,
+  `wg-client` at 00:30 UTC). Like `docker/`, `wg-server.service` bakes
+  in `--rotate -v`, rotating the whole fleet on every scheduled run — an
+  intentional deviation from the docs' general "routine jobs don't
+  rotate" guidance (see `docker/README.md`'s "Rotation on every run" for
+  the tradeoffs this accepts). `Dockerfile.build` cross-builds both
+  architectures (`x86_64`, `aarch64`) from one amd64 host via Arch's
+  official `aarch64-linux-gnu-gcc` cross toolchain — no buildx/QEMU
+  emulation, no OpenSSL to cross-build (rustls). `release.sh` builds,
+  uploads GitHub release assets via `gh`, and rewrites `PKGBUILD`'s
   `pkgver`/`sha256sums` to match.
 
 ## Testing pattern

@@ -86,9 +86,13 @@ makepkg -si
 This installs `wg-server`/`wg-client` to `/usr/bin`, and
 `wg-server.{service,timer}`/`wg-client.{service,timer}` to run them on
 the daily schedule `docs/wg-server.md` assumes (`wg-server` at 00:00
-UTC, `wg-client` at 00:30 UTC). After installing, drop your config into
-`/etc/wg-server/config.json` and/or `/etc/wg-client/config.json` (see
-Configure below) and enable the relevant timer:
+UTC, `wg-client` at 00:30 UTC). `wg-server.service` rotates every
+node's key on every run — see `docker/README.md`'s "Rotation on every
+run" for what that means operationally; edit the unit's `ExecStart` if
+you want the non-rotating schedule the docs describe instead. After
+installing, drop your config into `/etc/wg-server/config.json` and/or
+`/etc/wg-client/config.json` (see Configure below) and enable the
+relevant timer:
 
 ```sh
 sudo systemctl enable --now wg-server.timer   # server hosts

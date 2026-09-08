@@ -69,6 +69,16 @@ an interface in one network namespace and with one owner only: do not also
 enable `wg-quick@<iface>`, NetworkManager, or another tunnel controller for
 the same interface. A second invocation fails immediately with exit 1.
 
+`/run` is typically tmpfs and does not survive a reboot, so `wg-client`
+must create `/run/wg-client` itself rather than assume it exists.
+Create it (and the lock file within it) with `O_NOFOLLOW`/directory-relative
+operations, mode `0700`, root-owned. If the path already exists, verify it
+is a real directory (not a symlink or other file) with the expected
+ownership and mode before using it — fix the mode if it's merely wrong,
+but refuse to proceed (report a critical error) if it's a symlink or owned
+by another user, rather than silently reusing a directory an unprivileged
+process could have pre-created.
+
 ## 4. Client configuration schema
 
 ```json
@@ -345,12 +355,17 @@ total**, matching `wg-server`'s policy (see
   Restart an interrupted body from the same immutable object within the
   remaining budget; do not introduce a second five-attempt loop around it.
 - Use 10s per HTTP attempt and 30s for each complete call, including body
-  consumption and retries. Allow at most 180s total for discovery/download
-  and preflight. All startup recovery, candidate application, and rollback
-  share a single 120s local-operation budget, with 30s per subprocess.
-  Cancel and reap a timed-out subprocess before any recovery command to
-  prevent concurrent interface mutation. The complete pass is bounded by
-  300s; a failure preserves durable pending state when recovery is incomplete.
+  consumption and retries. Allow at most 180s total for discovery/download:
+  worst case is 3 discovery rounds × 2 calls (`current.json` plus the
+  generation file) × 30s, which exactly fills this budget, so preflight is
+  bounded separately rather than sharing it. Preflight (resolving endpoint
+  names, checking utilities/routes) gets its own 20s budget. All startup
+  recovery, candidate application, and rollback share a single 120s
+  local-operation budget, with 30s per subprocess. Cancel and reap a
+  timed-out subprocess before any recovery command to prevent concurrent
+  interface mutation. The complete pass is bounded by 320s (180 discovery/
+  download + 20 preflight + 120 local-operation); a failure preserves
+  durable pending state when recovery is incomplete.
 - These per-call budgets and the three-round discovery limit apply within
   one sync pass. The next scheduled invocation, or the next daemon interval
   (§7), gets a fresh budget.
@@ -401,7 +416,7 @@ User=root
 UMask=0077
 ExecStart=/usr/local/bin/wg-client sync --config /etc/wg-client/config.json --once
 KillMode=mixed
-TimeoutStartSec=330s
+TimeoutStartSec=350s
 TimeoutStopSec=150s
 LimitCORE=0
 ```
@@ -551,8 +566,9 @@ would need a different helper design and is outside v1.
 | `aws-sdk-s3`, `aws-config` | S3-compatible storage client (GetObject only) |
 | `hostname` | System hostname lookup |
 | `fd-lock` (or `fs2`) | `flock`-based single-instance guard |
-| `sha2` | Content-hash comparison (skip-if-unchanged, rollback comparisons) |
-| `wg-common` planned shared module | Strict config parser, key validation, limits, and canonical lowercase Crockford Base32 encoding for IDs/digests |
+| `sha2` | SHA-256 digest computation over downloaded configuration bytes, compared against `current.json`'s published digest and the locally persisted applied-hash state (§6) |
+| `ipnet` | CIDR overlap checks against the live routing table during preflight (§6) — a client-specific use, separate from `wg-common`'s config-parsing use below |
+| `wg-common` (shared crate, §3) | Strict config parser/validator, key validation, shared limits, and the canonical lowercase Crockford Base32 encoding for IDs/digests — the same implementation `wg-server` uses, so neither binary reimplements it independently |
 | `thiserror` / `anyhow` | Error types |
 | `tracing`, `tracing-subscriber` | Logging |
 | `tokio::signal` | Graceful shutdown in `--daemon` mode |

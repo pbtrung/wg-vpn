@@ -204,6 +204,18 @@ Run for both `apply` and `validate`, before any key handling or network call:
 - The shared limits are 4096 nodes, 16 MiB for topology/discovery JSON,
   and 1 MiB for each rendered configuration. Enforce limits before
   publication, so clients can use the same bounded parsers/downloads.
+- A master's file holds one `[Peer]` stanza per *other* node in the fleet
+  (§7), so its size scales with total node count, not master count: at
+  roughly 200–300 bytes per stanza (more with long hostnames or
+  `extra_allowed_ips`), a fleet near the 4096-node limit can push a
+  master's own rendered file close to or past the 1 MiB cap even with as
+  few as one master. Enforce the 1 MiB cap per rendered file as a hard
+  `apply`-time validation error naming the offending hostname and its
+  rendered size — never truncate or upload an oversized file. Operators
+  approaching this limit should keep the number of nodes any single
+  master must peer with well under the level implied by 1 MiB ÷
+  (bytes per stanza), rather than relying on the nominal 4096-node ceiling
+  in isolation.
 
 ## 7. Topology / peer-selection algorithm
 
@@ -472,6 +484,19 @@ Reject uppercase and the usual human-input aliases (`i`, `l`, `o`). This
 uses the [Crockford alphabet and numeric
 encoding](https://www.crockford.com/base32.html) with lowercase output.
 
+**This is not RFC 4648 Base32.** RFC 4648 groups input into fixed 5-byte
+blocks and encodes each block's bits independently (with `=` padding on a
+short final block); Crockford's encoding treats the entire input as one
+big-endian integer. For a 32-byte input the two schemes produce
+**different, same-length strings** for the same bytes. A stock Base32
+crate (e.g. Rust's `base32` or `data-encoding`, which implement RFC 4648)
+will silently produce the wrong value if reached for here — this
+encoding must be implemented as a big-integer conversion (e.g. via
+`num-bigint`, or a manual repeated divide-by-32 loop) in the shared
+`wg-common` module, not via a generic Base32 dependency, with unit tests
+that pin its output against known values derived from this specification
+(see [milestones.md](./milestones.md)) rather than trusting a generic crate.
+
 Use this encoding for **all application-defined digests**, including
 publication metadata, logged hashes, and clients' persisted applied
 hashes. Hash computation remains deterministic; generation IDs and pointer
@@ -608,13 +633,30 @@ and report unexpected names. Compare IDs for membership in the retained
 pair, never for chronological order. When an entry is null, it contributes
 no retained ID.
 
-After successful cleanup the bucket contains the current generation and
-at most one previous committed generation. A newly initialized fleet has
-no previous generation. Upload staging temporarily uses additional space;
-a crash or failed delete can leave extra objects until the next successful
-cleanup. Report cleanup failures separately from publication success and
-retry them on the next cron run, including runs with unchanged content.
-There is no retained archive beyond the one previous generation.
+As a defense-in-depth layer under the scheduler's guarantee — not a
+replacement for it — skip deleting any candidate object whose
+`LastModified` is younger than a fixed grace period (e.g. 15 minutes).
+This bounds the exact race named in §1 (conditional publication cannot by
+itself stop concurrent cleanup from deleting an active uploader's files):
+a legitimate in-flight upload from an overlapping job is always younger
+than its own upload started, so a grace period comfortably longer than
+the 8-minute job deadline ensures cleanup never deletes a file that could
+still belong to a run still in progress, while still reclaiming genuinely
+abandoned uploads on the next successful cleanup pass. This does not
+change what counts as *retained* — that remains pointer membership, never
+age — it only delays when an already-orphaned object becomes eligible for
+deletion.
+
+After successful cleanup the bucket contains the current generation, at
+most one previous committed generation, and possibly a handful of
+recently-orphaned objects still inside the deletion grace period above. A
+newly initialized fleet has no previous generation. Upload staging
+temporarily uses additional space; a crash or failed delete can leave
+extra objects until the next successful cleanup. Report cleanup failures
+separately from publication success and retry them on the next cron run,
+including runs with unchanged content. There is no retained archive
+beyond the one previous generation and whatever the grace period is
+still holding.
 
 Provision unversioned storage without retention locks for these objects.
 S3 versioned or versioning-suspended buckets are outside this v1 cleanup
@@ -761,8 +803,8 @@ not authorization to reconnect a removed node.
 | `aws-sdk-s3`, `aws-config` | S3-compatible storage client, with custom endpoint + `auto`/path-style support for R2 |
 | `x25519-dalek`, `rand` | WireGuard-compatible key generation, PSKs, and 32-byte random generation IDs |
 | `base64` | WireGuard configuration key encoding |
-| `sha2` | SHA-256 digests, encoded by a shared canonical lowercase Crockford Base32 utility |
-| `ipnet`, `url` | Typed route/endpoint parsing and validation |
+| `sha2` | SHA-256 digest computation over rendered configuration bytes |
+| `wg-common` (shared crate, §3) | Strict config parser/renderer and key validation shared with `wg-client`; wraps `ipnet`/`url` for typed route/endpoint validation and implements the canonical lowercase Crockford Base32 encoding for IDs/digests (§10) — both binaries call this one implementation rather than each reimplementing the encoding |
 | `thiserror` / `anyhow` | Error types |
 | `tracing`, `tracing-subscriber` | Logging |
 

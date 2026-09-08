@@ -915,4 +915,71 @@ mod tests {
         let err = resolve_keys(&topo, &old_configs, &RotateSelection::None).unwrap_err();
         assert!(matches!(err, ApplyError::ConflictingPsk { .. }));
     }
+
+    /// M6 scale check (docs/milestones.md §6): a single master's rendered
+    /// file holds one peer stanza per *other* node in the fleet
+    /// (wg-server.md §6's "master fan-out" note), so a fleet near the
+    /// 4096-node limit can push it close to the 1 MiB cap even with just
+    /// one master. This measures both that size and apply()'s wall-clock
+    /// time against a fully in-memory backend (no network latency, so
+    /// this isolates the CPU-bound rendering/validation cost from the
+    /// 8-minute job deadline's network-bound budget).
+    ///
+    /// Ignored by default: this is a scheduled/informational benchmark
+    /// (docs/milestones.md §6 and §8's CI lanes table), not a per-commit
+    /// gate — run it explicitly with `cargo test --release -- --ignored`.
+    #[tokio::test]
+    #[ignore]
+    async fn scale_one_master_near_the_node_limit() {
+        let node_count = wg_common::limits::MAX_NODES;
+        let mut nodes = vec![node(
+            "master-01",
+            "10.0.0.1",
+            Some("master-01.example:51820"),
+        )];
+        for i in 1..node_count {
+            let addr_index = i + 1; // +1 so it never collides with the master's 10.0.0.1
+            let a = (addr_index / (256 * 256)) as u8;
+            let b = ((addr_index / 256) % 256) as u8;
+            let c = (addr_index % 256) as u8;
+            nodes.push(node(
+                &format!("spoke-{i}"),
+                &format!("10.{a}.{b}.{c}"),
+                None,
+            ));
+        }
+        let cfg = TopologyConfig {
+            r2_config: r2(),
+            nodes,
+            master: vec!["master-01".to_string()],
+        };
+
+        let storage = MockStorage::new();
+        let start = std::time::Instant::now();
+        let report = apply(&storage, &cfg, &ApplyOptions::default())
+            .await
+            .unwrap();
+        let elapsed = start.elapsed();
+
+        assert!(report.published);
+        assert_eq!(report.uploaded_hostnames.len(), node_count);
+
+        let master_key = node_object_key("master-01", report.new_generation_id.as_ref().unwrap());
+        let master_file = storage.get_object(&master_key).await.unwrap().unwrap();
+        eprintln!(
+            "scale: {node_count} nodes, 1 master, master file = {} bytes, apply() wall time = {elapsed:?}",
+            master_file.bytes.len(),
+        );
+        assert!(
+            master_file.bytes.len() <= wg_common::limits::MAX_RENDERED_CONFIG_BYTES,
+            "master file exceeded the 1 MiB cap: {} bytes",
+            master_file.bytes.len()
+        );
+        // Rendering/validation alone (no network latency) should be a
+        // small fraction of the 8-minute job deadline.
+        assert!(
+            elapsed < std::time::Duration::from_secs(60),
+            "apply() took {elapsed:?} against an in-memory backend, unexpectedly slow"
+        );
+    }
 }

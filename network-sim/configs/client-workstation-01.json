@@ -1,0 +1,10 @@
+{
+  "r2_config": {
+    "endpoint": "http://minio:9000",
+    "read_only_access_key_id": "wgadmin",
+    "read_only_secret_access_key": "wgadminsecret",
+    "region": "auto",
+    "bucket": "wg-confs"
+  },
+  "conf_path": "/etc/wireguard/wg0.conf"
+}

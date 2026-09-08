@@ -1,0 +1,44 @@
+{
+  "r2_config": {
+    "endpoint": "http://minio:9000",
+    "read_write_access_key_id": "wgadmin",
+    "read_write_secret_access_key": "wgadminsecret",
+    "region": "auto",
+    "bucket": "wg-confs"
+  },
+  "nodes": [
+    {
+      "hostname": "master-us",
+      "wg_config": {
+        "tunnel_address": "10.10.0.1/32",
+        "listen_port": 51820,
+        "endpoint": "master-us:51820"
+      }
+    },
+    {
+      "hostname": "master-eu",
+      "wg_config": {
+        "tunnel_address": "10.10.0.2/32",
+        "listen_port": 51820,
+        "endpoint": "master-eu:51820"
+      }
+    },
+    {
+      "hostname": "workstation-01",
+      "wg_config": {
+        "tunnel_address": "10.10.0.100/32",
+        "listen_port": 51820,
+        "persistent_keepalive": 5
+      }
+    },
+    {
+      "hostname": "mobile-01",
+      "wg_config": {
+        "tunnel_address": "10.10.0.101/32",
+        "listen_port": 51820,
+        "persistent_keepalive": 5
+      }
+    }
+  ],
+  "master": ["master-us", "master-eu"]
+}

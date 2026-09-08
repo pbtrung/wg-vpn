@@ -1,0 +1,11 @@
+# Runtime image for wg-server, reusing a host-built release binary
+# (network-sim/run.sh builds it first) rather than recompiling inside
+# Docker. Base matches the host's Arch Linux glibc to avoid a
+# dynamic-linking mismatch.
+FROM archlinux:latest
+
+RUN pacman -Sy --noconfirm ca-certificates && pacman -Scc --noconfirm
+
+COPY target/release/wg-server /usr/local/bin/wg-server
+
+ENTRYPOINT ["/usr/local/bin/wg-server"]

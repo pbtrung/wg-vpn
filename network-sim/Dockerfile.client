@@ -1,0 +1,11 @@
+# Runtime image for wg-client, reusing a host-built release binary
+# (network-sim/run.sh builds it first). Needs the real wg-quick/wg/ip
+# tooling to actually manage a kernel WireGuard interface.
+FROM archlinux:latest
+
+RUN pacman -Sy --noconfirm ca-certificates wireguard-tools iproute2 iputils bash \
+    && pacman -Scc --noconfirm
+
+COPY target/release/wg-client /usr/local/bin/wg-client
+
+ENTRYPOINT ["/usr/local/bin/wg-client"]

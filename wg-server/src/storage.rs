@@ -87,13 +87,13 @@ pub struct R2Client {
 
 impl R2Client {
     pub fn new(cfg: &R2Config) -> Self {
-        let mut creds_builder =
-            Credentials::builder().access_key_id(cfg.read_write_access_key_id.clone());
-        creds_builder = creds_builder.secret_access_key(cfg.read_write_secret_access_key.clone());
-        if let Some(token) = &cfg.session_token {
-            creds_builder = creds_builder.session_token(token.clone());
-        }
-        let credentials = creds_builder.build();
+        let credentials = Credentials::new(
+            cfg.read_write_access_key_id.clone(),
+            cfg.read_write_secret_access_key.clone(),
+            cfg.session_token.clone(),
+            None,
+            "wg-server-config",
+        );
 
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())

@@ -1,0 +1,86 @@
+name: wg-network-sim
+
+services:
+  minio:
+    image: minio/minio:latest
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: wgadmin
+      MINIO_ROOT_PASSWORD: wgadminsecret
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    networks: [wgnet]
+
+  bucket-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - >
+        mc alias set local http://minio:9000 wgadmin wgadminsecret &&
+        mc mb --ignore-existing local/wg-confs
+    networks: [wgnet]
+
+  server:
+    build:
+      context: ..
+      dockerfile: network-sim/Dockerfile.server
+    depends_on:
+      bucket-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./configs/topology.json:/etc/wg-server/topology.json:ro
+    command: ["apply", "--config", "/etc/wg-server/topology.json"]
+    networks: [wgnet]
+
+  master-us:
+    build:
+      context: ..
+      dockerfile: network-sim/Dockerfile.client
+    hostname: master-us
+    cap_add: [NET_ADMIN]
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ./configs/client-master-us.json:/etc/wg-client/config.json:ro
+    networks: [wgnet]
+
+  master-eu:
+    build:
+      context: ..
+      dockerfile: network-sim/Dockerfile.client
+    hostname: master-eu
+    cap_add: [NET_ADMIN]
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ./configs/client-master-eu.json:/etc/wg-client/config.json:ro
+    networks: [wgnet]
+
+  workstation-01:
+    build:
+      context: ..
+      dockerfile: network-sim/Dockerfile.client
+    hostname: workstation-01
+    cap_add: [NET_ADMIN]
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ./configs/client-workstation-01.json:/etc/wg-client/config.json:ro
+    networks: [wgnet]
+
+  mobile-01:
+    build:
+      context: ..
+      dockerfile: network-sim/Dockerfile.client
+    hostname: mobile-01
+    cap_add: [NET_ADMIN]
+    entrypoint: ["sleep", "infinity"]
+    volumes:
+      - ./configs/client-mobile-01.json:/etc/wg-client/config.json:ro
+    networks: [wgnet]
+
+networks:
+  wgnet:

@@ -32,17 +32,18 @@ pub struct R2ReadClient {
 
 impl R2ReadClient {
     pub fn new(cfg: &R2ReadConfig) -> Self {
-        let mut creds_builder =
-            Credentials::builder().access_key_id(cfg.read_only_access_key_id.clone());
-        creds_builder = creds_builder.secret_access_key(cfg.read_only_secret_access_key.clone());
-        if let Some(token) = &cfg.session_token {
-            creds_builder = creds_builder.session_token(token.clone());
-        }
+        let credentials = Credentials::new(
+            cfg.read_only_access_key_id.clone(),
+            cfg.read_only_secret_access_key.clone(),
+            cfg.session_token.clone(),
+            None,
+            "wg-client-config",
+        );
         let config = aws_sdk_s3::Config::builder()
             .behavior_version(BehaviorVersion::latest())
             .region(Region::new(cfg.region.clone()))
             .endpoint_url(cfg.endpoint.clone())
-            .credentials_provider(creds_builder.build())
+            .credentials_provider(credentials)
             .force_path_style(true)
             .retry_config(RetryConfig::standard().with_max_attempts(RETRY_MAX_ATTEMPTS))
             .build();

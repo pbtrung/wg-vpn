@@ -165,8 +165,10 @@ recovery does not depend on storage availability. Then:
    `nodes/{hostname}/{current.id}.conf`; never follow an arbitrary
    URL or path from downloaded metadata.
 3. Enforce the shared limits: 16 MiB for discovery JSON, 4096 nodes, and
-   1 MiB per configuration, regardless of `Content-Length`. Download the
-   entire file with a finite deadline. Compute
+   1 MiB per configuration, regardless of `Content-Length`. Each is an
+   inclusive maximum (see [wg-server.md §6](./wg-server.md#6-hostname--topology-validation)) —
+   reject only the first byte/node past it, not an exactly-at-limit value.
+   Download the entire file with a finite deadline. Compute
    SHA-256 over its exact bytes and encode the 32-byte digest using the
    same 52-character lowercase Crockford Base32 format. Compare it with
    `current.nodes[hostname]`, then validate the configuration before making

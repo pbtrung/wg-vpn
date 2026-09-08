@@ -202,7 +202,10 @@ Run for both `apply` and `validate`, before any key handling or network call:
   side. Hostname/port syntax is validated offline; DNS resolution, UDP
   reachability, forwarding, and NAT mappings are deployment checks (§7).
 - The shared limits are 4096 nodes, 16 MiB for topology/discovery JSON,
-  and 1 MiB for each rendered configuration. Enforce limits before
+  and 1 MiB for each rendered configuration. Each is an inclusive maximum:
+  exactly 4096 nodes, a discovery JSON of exactly 16 MiB, or a rendered
+  file of exactly 1 MiB is valid; the first byte/node past that is what's
+  rejected. MiB means `1024 × 1024` bytes. Enforce limits before
   publication, so clients can use the same bounded parsers/downloads.
 - A master's file holds one `[Peer]` stanza per *other* node in the fleet
   (§7), so its size scales with total node count, not master count: at

@@ -129,8 +129,15 @@ Test binary-specific decisions in their owning crates as listed below.
   alone is insufficient.
   MinIO did support wildcard conditional creation in later releases;
   the [upstream discussion](https://github.com/minio/minio/discussions/20318)
-  confirms it after an upgrade to the September 2024 release. Backend
-  selection should use pinned-version conformance and maintenance checks.
+  confirms it after an upgrade to the September 2024 release. However,
+  **MinIO's OSS repository was archived in April 2026, and LocalStack's in
+  March 2026** — neither has an ongoing maintenance/security-fix path
+  going forward, regardless of which historical release passed
+  conformance. Treat "passed conformance on a pinned version" and "still
+  maintained" as two separate, both-required conditions before adopting a
+  local backend; re-check the current archival/fork status of whichever
+  backend is chosen at adoption time, since this landscape has shifted
+  more than once in a single year.
 - **Local runs**: use a pinned local backend for the cases it qualifies for.
   If it lacks required conditionals, use it only for independent read/list
   cases; deterministic transport tests cover application protocol decisions

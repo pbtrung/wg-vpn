@@ -21,8 +21,8 @@ sha256sums=('6ea069ee51ffd204e68b66cb4263067a4c40b4c67fa266ad157d3adce609c423'
             '9cf0c99b68b5506e3f237866c3f76723bd27a662ab1a6e62e795f813ec04792d'
             '6922f7960b51ef44317b3cf754d763080cb22b9d43210098135f7b5a7bdc7dc2'
             '43ee3a03927f51dcf681554acbc6e2668dca58fc896001530f5cbfb2fe95af27')
-sha256sums_x86_64=('6ec7ff899da6ab7c6ed43bb0a985d8358bbf2c4fa13e5483df7a32354b049db9')
-sha256sums_aarch64=('3dba2ddc549e1d6ba4f8a40997129747648c2e6287db018af01936b9a0ec2dc9')
+sha256sums_x86_64=('71b76f2ebe14d0c2700eab952f2d23192574a3244ffd42b6777d2b1a7a966ca8')
+sha256sums_aarch64=('5a208f940cacada0e95779052f3f4ed2275771f9a4ed9219743a1c97a1bd69ee')
 
 source_aarch64=("https://github.com/pbtrung/wg-vpn/releases/download/v${pkgver}/wg-vpn-aarch64.tar.gz")
 

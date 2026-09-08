@@ -148,6 +148,10 @@ sudo wg-client sync --config client.json --once
 sudo wg-client sync --config client.json --daemon --interval 24h
 ```
 
+Both binaries default to warn-level logging; add `-v`/`-vv`/`-vvv` (info/
+debug/trace) anywhere on the command line, or set `RUST_LOG` for full
+control (it takes priority over `-v` when set).
+
 Exact flag reference, the local transaction/rollback model, and locking
 behavior are in [`docs/wg-client.md`](docs/wg-client.md).
 

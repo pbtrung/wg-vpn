@@ -15,6 +15,10 @@ use std::process::ExitCode;
 struct Cli {
     #[command(subcommand)]
     command: Command,
+    /// Increase log verbosity (-v = info, -vv = debug, -vvv = trace).
+    /// Ignored if RUST_LOG is set.
+    #[arg(short, long, global = true, action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 #[derive(Subcommand)]
@@ -153,13 +157,28 @@ fn report(outcome: &sync::SyncOutcome) {
     }
 }
 
+/// RUST_LOG, if set, always wins; otherwise `-v`/`-vv`/`-vvv` selects
+/// info/debug/trace, defaulting to warn with no flag at all.
+fn build_env_filter(verbose: u8) -> tracing_subscriber::EnvFilter {
+    if let Ok(filter) = tracing_subscriber::EnvFilter::try_from_default_env() {
+        return filter;
+    }
+    let level = match verbose {
+        0 => "warn",
+        1 => "info",
+        2 => "debug",
+        _ => "trace",
+    };
+    tracing_subscriber::EnvFilter::new(level)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    let cli = Cli::parse();
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(build_env_filter(cli.verbose))
         .init();
 
-    let cli = Cli::parse();
     match cli.command {
         Command::Sync {
             config,

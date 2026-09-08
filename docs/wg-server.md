@@ -719,7 +719,11 @@ activation barrier or a zero-downtime guarantee.
 - Reissuing `apply --rotate` creates another rotation, even if a prior
   invocation already committed but lost its response. Inspect publication
   state before manually repeating a rotation; the normal cron command
-  contains no `--rotate` flag.
+  contains no `--rotate` flag. (The packaged `docker/` cron image is an
+  intentional exception — its entrypoint bakes in a bare `--rotate`, so
+  every scheduled run there does rotate the whole fleet; see
+  `docker/README.md`'s "Rotation on every run" for the operational
+  tradeoffs that choice accepts.)
 
 For recovery from damaged published state, stop scheduled publication and
 confirm the previous job has terminated. Verify the retained previous

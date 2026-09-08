@@ -1,11 +1,42 @@
 # `wg-server` as a cloud cron job
 
-This image runs `wg-server apply` once and exits — no in-container
-scheduler. Point your cloud platform's cron/scheduled-job feature at it
-(GCP Cloud Run Jobs + Cloud Scheduler, AWS ECS Scheduled Tasks / EventBridge
-Scheduler, a Kubernetes `CronJob`, ...); `docs/wg-server.md` §1 assumes
-exactly this shape (`0 0 * * *` UTC, no persistent filesystem between
-runs).
+This image runs `wg-server apply --rotate -v` once and exits — no
+in-container scheduler. Point your cloud platform's cron/scheduled-job
+feature at it (GCP Cloud Run Jobs + Cloud Scheduler, AWS ECS Scheduled
+Tasks / EventBridge Scheduler, a Kubernetes `CronJob`, ...); `docs/wg-server.md`
+§1 assumes this general shape (no persistent filesystem between runs),
+but see "Rotation on every run" below for how this image's schedule
+differs from the docs' general recommendation.
+
+## Rotation on every run
+
+The `ENTRYPOINT` bakes in a bare `--rotate` (every node) and `-v`, so
+**every scheduled invocation force-rotates every node's key and
+immediately prunes down to current + previous** (`--rotate` implies
+`--prune` — see `docs/wg-server.md` §4). This is a deliberate choice for
+this packaged deployment, not the general guidance: `docs/wg-server.md`
+§10–11 describes the *default-assumed* usage as a non-rotating
+`apply` on a schedule, precisely because a rotation can interrupt a live
+tunnel until each node's `wg-client` next syncs. Rotating on every
+scheduled run means:
+
+- Every node must run `wg-client sync` frequently enough relative to
+  this image's own schedule that it reliably picks up each new
+  generation before the *next* rotation supersedes it — an offline or
+  infrequently-syncing node can permanently miss a generation once both
+  `current` and `previous` have rotated past it (`docs/wg-server.md`
+  §10's "Retention is independent of client schedules" caveat).
+- There is no stable, long-lived key for any node; treat rotation as the
+  normal condition rather than an exceptional operator action.
+
+If you want the general (non-rotating, occasional manual rotation)
+usage `docs/wg-server.md` describes instead, override the entrypoint:
+
+```sh
+docker run --rm -e WG_SERVER_CONFIG=... -v ...:... \
+  --entrypoint /usr/local/bin/wg-server \
+  wg-server apply --config /etc/wg-server/config.json
+```
 
 ## Build
 
@@ -32,27 +63,24 @@ docker run --rm \
 
 ## Extra flags
 
-The image's `ENTRYPOINT` is `wg-server apply`; anything you pass as
-container args is appended, so a one-off dry run or rotation looks like:
+The image's `ENTRYPOINT` is `wg-server apply --rotate -v`; anything you
+pass as container args is appended to that, not a replacement for it:
 
 ```sh
+# Plan the rotation without publishing or deleting anything.
 docker run --rm -e WG_SERVER_CONFIG=... -v ...:... wg-server --dry-run
 
-# Rotate one node's key (repeatable), or every node with a bare --rotate.
-# Either form always cleans up immediately (skips the usual ~15-minute
-# retention grace period), since rotation is already a deliberate,
-# manual action rather than the routine unattended cron invocation.
-docker run --rm -e WG_SERVER_CONFIG=... -v ...:... wg-server --rotate workstation-01
-docker run --rm -e WG_SERVER_CONFIG=... -v ...:... wg-server --rotate
-
-# More verbose logs (-v info, -vv debug, -vvv trace) -- or set
-# -e RUST_LOG=debug instead, which takes priority if both are given.
+# -v accumulates (Count-based), so this bakes in -vv (debug) for this
+# run only -- or set -e RUST_LOG=debug instead, which takes priority
+# over any number of -v's if both are given.
 docker run --rm -e WG_SERVER_CONFIG=... -v ...:... wg-server -v
 ```
 
-Flags combine normally, e.g. `wg-server --rotate -v` for a verbose
-full-fleet rotation (`--prune` is redundant here since `--rotate` already
-implies it, but harmless to add).
+Because a bare `--rotate` is already baked in, you **cannot** append
+`--rotate <hostname>` to rotate only specific node(s) — that mixes a bare
+and named `--rotate` in one invocation, which `wg-server` rejects. To
+rotate only specific nodes (or to not rotate at all), override the
+entrypoint as shown in "Rotation on every run" above.
 
 ## Notes
 
@@ -72,5 +100,6 @@ implies it, but harmless to add).
   state, so a fresh container on every scheduled invocation is correct,
   not just tolerated.
 - `--rotate`/`--dry-run`/`--prune` are documented in the root
-  [`README.md`](../README.md#use) and `docs/wg-server.md` §4; the normal
-  scheduled invocation should pass none of them.
+  [`README.md`](../README.md#use) and `docs/wg-server.md` §4. This
+  image's baked-in `--rotate -v` is specific to this packaged
+  deployment — see "Rotation on every run" above.

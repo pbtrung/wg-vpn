@@ -32,4 +32,8 @@ RUN apk add --no-cache ca-certificates libgcc \
 COPY --from=builder /build/target/release/wg-server /usr/local/bin/wg-server
 
 USER wg-server
-ENTRYPOINT ["/usr/local/bin/wg-server", "apply"]
+# --rotate (bare = every node) + -v: this image force-rotates every
+# node's key on every scheduled run (see docker/README.md's "Rotation"
+# note for why that's an intentional deviation from the general
+# recommended cron usage in docs/wg-server.md).
+ENTRYPOINT ["/usr/local/bin/wg-server", "apply", "--rotate", "-v"]

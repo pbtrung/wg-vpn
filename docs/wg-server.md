@@ -253,8 +253,9 @@ back serves both purposes in the same pass.
 
 1. Compute the desired node set and edge set from `--config` (§7).
 2. Fetch every currently-published `{hostname}.conf` for hostnames in the
-   desired set (parallel `GetObject` calls; missing objects are not an
-   error, just "nothing to reuse yet").
+   desired set (parallel `GetObject` calls, each with its own retry budget
+   — see Retry policy in §10; missing objects are not an error, just
+   "nothing to reuse yet").
 3. Resolve rotation targets: bare `--rotate` → all desired nodes;
    `--rotate <hostname>` → the named node(s) (error if any name isn't in
    the desired set).
@@ -263,14 +264,16 @@ back serves both purposes in the same pass.
 5. For each desired edge, resolve its preshared key per the reuse/rotation
    rules above.
 6. Render `.conf` for every desired node (§9).
-7. Upload changed files, skipping ones that are byte-identical to what was
-   fetched in step 2 (§10). Anything freshly keyed will always differ and
-   will always be uploaded — along with every peer that references it,
-   since their rendered `AllowedIPs`/`PublicKey`/`PresharedKey` lines
-   changed too.
-8. `--prune`: delete `.conf` objects in the bucket for hostnames no longer
-   in the desired set (via a `ListObjectsV2` pass — not related to the
-   per-node fetches in step 2).
+7. Upload changed files (skipping ones byte-identical to what was fetched
+   in step 2) as a single all-or-nothing batch: if every upload succeeds,
+   continue to step 8; if any fails, roll the whole batch back (§10) and
+   stop — `apply` exits non-zero without ever reaching step 8. Anything
+   freshly keyed will always differ and will always be part of this batch
+   — along with every peer that references it, since their rendered
+   `AllowedIPs`/`PublicKey`/`PresharedKey` lines changed too.
+8. `--prune`: only reached if step 7 fully succeeded. Delete `.conf`
+   objects in the bucket for hostnames no longer in the desired set (via a
+   `ListObjectsV2` pass — not related to the per-node fetches in step 2).
 
 ## 9. Rendered `wg-quick` format
 
@@ -326,35 +329,98 @@ Notes:
 - The `GetObject` fetches already done in §8 step 2 double as the
   skip-if-unchanged check: compare the freshly rendered content for a node
   to what was fetched for it; skip the `PutObject` call if identical.
+
+### Retry policy
+
+Every individual storage call — `GetObject`, `PutObject`, `DeleteObject`,
+`ListObjectsV2` — is retried up to **5 attempts total** before being
+treated as failed:
+
+- Only transient errors are retried: network timeouts/connection resets,
+  5xx responses, and throttling (429). Auth failures (401/403) and other
+  non-retryable errors fail immediately without consuming retries.
+- A 404 on `GetObject` while checking for a previously-published `.conf`
+  isn't an error at all (§8) — it means "nothing to reuse yet" and is
+  never retried.
+- Backoff between attempts is exponential with jitter (1000ms base,
+  doubling each attempt, capped around 5s), so a brief throttling window
+  doesn't immediately escalate into a rollback.
+- The 5-attempt budget is per call, not per `apply` run: rolling back 3
+  nodes after a failed upload gives each of those 3 rollback calls its own
+  independent 5 attempts.
+- Implementation note: `aws-sdk-s3`'s built-in `RetryConfig` (`max_attempts`,
+  standard/adaptive retry mode) already implements exactly this — set
+  `max_attempts(5)` on the client rather than hand-rolling a retry loop.
+
+### Consistency: all published `.conf` files or none
+
+A partial upload would leave some nodes' peers pointing at keys other
+nodes haven't picked up yet — a state the topology should never actually
+be in. `wg-server` treats the set of changed files (everything not
+skipped by the check above) as a single all-or-nothing batch:
+
+1. Before uploading anything, it already holds — from the `GetObject`
+   fetches in §8 step 2 — the exact previous content of every node about
+   to be overwritten (or the fact that a node has no previous content,
+   because it's brand new).
+2. Attempt `PutObject` for every changed node (each attempt already
+   carries its own 5-try retry budget — see Retry policy above).
+3. If all succeed: the batch is done. Continue to `--prune` (§8 step 8).
+4. If any fails (i.e. exhausts its 5 attempts): roll back every node in
+   this batch that *did* succeed — `PutObject` its previous content back,
+   or `DeleteObject` it if it had no previous content (i.e. undo the
+   "create"). Each rollback call gets its own fresh 5-attempt retry
+   budget, since restoring consistency is the entire point. `apply` then
+   exits non-zero without running `--prune`.
+5. If a rollback call itself exhausts its retries, that hostname is
+   reported as a **critical** error — the object is left in whatever state
+   the failed rollback attempt left it in, and needs manual reconciliation
+   (re-running `apply` will generally fix it, since it just re-diffs
+   against whatever the bucket currently holds either way).
+
+This is a compensating action, not a real distributed transaction — a hard
+crash or power loss *during* the upload batch (as opposed to a clean
+error return) skips the rollback logic entirely and can leave a genuinely
+partial batch live. This residual risk is inherent to using an object
+store with no native multi-object transactions: R2 (and S3-compatible
+storage generally) only guarantees strong consistency per individual
+object — immediate, global read-after-write on a single key — with no
+cross-object atomicity and no batch-put primitive to lean on instead
+([R2 consistency model](https://developers.cloudflare.com/r2/reference/consistency/)).
+It's mitigated by `apply` being safe to simply re-run afterward (§11),
+which converges the bucket to match `--config` regardless of what state
+it was left in.
+
 - `--prune`: `ListObjectsV2` the bucket, and delete any `{hostname}.conf`
-  object whose hostname is not in the current desired node set (§7).
-- There is no cross-object transaction: if `apply` uploads 5 files and
-  fails on the 3rd, the first two are already live. This is safe by
-  design — an uploaded `.conf` for one node never depends on another
-  node's `.conf` having already been uploaded (each file is
-  self-contained), so a partial run just means some nodes haven't picked
-  up the latest topology yet. Re-running `apply` is idempotent: nodes that
-  already got their new key will simply be read back and reused on the
-  retry, not re-rotated.
+  object whose hostname is not in the current desired node set (§7). Only
+  runs after the upload batch above fully succeeds.
 - On completion, print/log a summary: nodes uploaded, nodes skipped
-  (unchanged), nodes pruned, nodes/edges freshly keyed.
+  (unchanged), nodes pruned, nodes/edges freshly keyed, and — on failure —
+  which nodes were rolled back and whether any rollback itself failed.
 
 ## 11. Error handling
 
 - Schema/topology validation errors (§6) abort before any key handling or
   network call — fail closed.
-- A storage error on a given `GetObject`/`PutObject`/`DeleteObject` call is
-  logged with the hostname and does not abort the rest of the run;
-  `apply` exits non-zero at the end if anything failed, listing which
-  hostnames still need a retry.
+- A storage error on any `PutObject` during the upload batch (§10) triggers
+  a rollback of that batch and a non-zero exit; `--prune` never runs in
+  this case. The error report names the hostname whose upload failed and,
+  separately, any hostname whose rollback itself failed and needs manual
+  attention.
+- A storage error during the initial `GetObject` fetches (§8 step 2) or
+  during `--prune`'s `ListObjectsV2`/`DeleteObject` calls aborts the run
+  before/after the upload batch respectively, with nothing to roll back in
+  either case (no uploads were attempted yet, or they already succeeded
+  and prune failures don't affect published `.conf` correctness).
 - If a currently-published `.conf` can't be parsed (corrupted object,
   manual edit, etc.) while trying to reuse its key, treat that node as if
   nothing were published — generate a fresh keypair for it, log a warning
   naming the hostname so the operator knows a rotation happened
   incidentally, not because it was requested.
-- Because `wg-server` keeps no state of its own, a crash or interrupted run
-  leaves nothing to reconcile beyond the bucket's own contents — simply
-  re-run `apply`.
+- Because `wg-server` keeps no state of its own, simply re-running `apply`
+  after any failure (including one where rollback partially failed) is
+  always the correct recovery action — it re-diffs against whatever the
+  bucket currently holds and converges from there.
 
 ## 12. Security considerations
 

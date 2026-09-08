@@ -101,8 +101,8 @@ sequenceDiagram
 
     C->>C: acquire flock(lock_file)
     C->>C: resolve hostname
-    C->>S: GetObject {bucket}/{hostname}.conf
-    alt download failed (network/404/etc.)
+    C->>S: GetObject {bucket}/{hostname}.conf (up to 5 attempts, see §6 Retry policy)
+    alt download failed (all attempts exhausted, or 404)
         C->>C: log error, exit non-zero
         Note over C,W: existing interface, if any, is left untouched
     else download OK
@@ -133,6 +133,26 @@ sequenceDiagram
     end
     C->>C: release lock
 ```
+
+### Retry policy
+
+The `GetObject` download is retried up to **5 attempts total** before
+being treated as failed, matching `wg-server`'s policy (see
+[wg-server.md §10](./wg-server.md#10-upload-to-storage)):
+
+- Only transient errors are retried (timeouts/connection resets, 5xx,
+  429 throttling), with exponential backoff and jitter between attempts
+  (1000ms base, doubling, capped around 5s).
+- A `404` (no `.conf` published for this hostname) is not retried — it's
+  treated as a configuration problem, not a transient failure.
+- Auth errors (401/403) are not retried either — retrying with the same
+  bad credentials wastes the whole budget on a failure that will not
+  change.
+- Implementation note: `aws-sdk-s3`'s built-in `RetryConfig` with
+  `max_attempts(5)` covers this without a hand-rolled retry loop.
+- This is a single sync pass's retry budget, separate from and smaller in
+  scope than `--daemon`'s outer retry-next-interval behavior (§7) — 5
+  quick attempts within one pass, not 5 attempts spread across intervals.
 
 Key properties this preserves:
 
@@ -214,8 +234,9 @@ letting `wg-quick` fail deep in the apply step.
 
 | Failure | Behavior |
 |---|---|
-| Storage endpoint unreachable / auth error | Log, exit non-zero, existing tunnel untouched. Daemon mode retries next interval. |
-| Object not found (`404`) for this hostname | Log a clear "hostname not registered in wg-server config?" error, exit non-zero, existing tunnel untouched. |
+| Storage endpoint unreachable (transient) | Retried up to 5 attempts (§6); if all fail, log, exit non-zero, existing tunnel untouched. Daemon mode retries next interval. |
+| Auth error | Not retried (§6). Log, exit non-zero, existing tunnel untouched. Daemon mode retries next interval (won't help until credentials are fixed). |
+| Object not found (`404`) for this hostname | Not retried (§6). Log a clear "hostname not registered in wg-server config?" error, exit non-zero, existing tunnel untouched. |
 | Downloaded content fails shallow validation | Reject before writing, exit non-zero, existing tunnel untouched. |
 | `wg-quick up` fails on the new config | Roll back to `.bak`, bring that back up, exit non-zero. |
 | Two `wg-client` invocations run concurrently | Second one fails to acquire `--lock-file` and exits immediately with a log message. |

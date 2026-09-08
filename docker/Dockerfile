@@ -1,8 +1,13 @@
 # Production image for running `wg-server apply` as a scheduled cloud
 # cron job (docs/wg-server.md §1: "an ephemeral cloud cron job... no
-# persistent filesystem"). Build from the repo root:
+# persistent filesystem"). The builder clones its own source from git
+# instead of copying the local build context, so this can build from
+# anywhere (no repo checkout required) and always builds a known,
+# committed ref rather than whatever uncommitted state happens to be on
+# disk:
 #
 #   docker build -f docker/Dockerfile -t wg-server .
+#   docker build -f docker/Dockerfile -t wg-server --build-arg WG_VPN_REF=v1.2.3 .
 #
 # The topology config path is read from the WG_SERVER_CONFIG
 # environment variable (see docker/README.md) rather than baked in, so
@@ -16,9 +21,11 @@
 
 FROM alpine:edge AS builder
 RUN apk update && apk --no-cache upgrade
-RUN apk add --no-cache rust cargo musl-dev gcc cmake make perl
+RUN apk add --no-cache rust cargo musl-dev gcc cmake make perl git
+ARG WG_VPN_REPO=https://github.com/pbtrung/wg-vpn.git
+ARG WG_VPN_REF=main
 WORKDIR /build
-COPY . .
+RUN git clone --depth 1 --branch "$WG_VPN_REF" "$WG_VPN_REPO" .
 RUN cargo build --release --locked -p wg-server
 
 FROM alpine:edge

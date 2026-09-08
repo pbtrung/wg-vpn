@@ -40,8 +40,21 @@ docker run --rm -e WG_SERVER_CONFIG=... -v ...:... \
 
 ## Build
 
+The builder stage clones its own source from git rather than copying the
+local build context, so this builds a known, committed ref (default
+`main`) rather than whatever uncommitted state happens to be on disk —
+and works from any directory, since nothing besides `docker/Dockerfile`
+itself is read from local disk:
+
 ```sh
 docker build -f docker/Dockerfile -t wg-server .
+
+# Pin a specific tag/branch/commit instead of main:
+docker build -f docker/Dockerfile -t wg-server --build-arg WG_VPN_REF=v1.2.3 .
+
+# Build from a fork:
+docker build -f docker/Dockerfile -t wg-server \
+  --build-arg WG_VPN_REPO=https://github.com/<you>/wg-vpn.git .
 ```
 
 ## Configure
@@ -95,6 +108,12 @@ entrypoint as shown in "Rotation on every run" above.
   pull from.
 - Debug interactively with `docker run --rm -it --entrypoint sh
   wg-server` (Alpine's `sh` is available, unlike a distroless image).
+- The build context (the `.` in `docker build -f docker/Dockerfile -t
+  wg-server .`) isn't actually read by the builder stage — it clones
+  its own source from git instead (see Build above) — so it can safely
+  be a smaller directory, e.g. `docker build -f docker/Dockerfile -t
+  wg-server docker/`, if sending the whole repo as context is
+  undesirable.
 - Nothing in this image persists between runs by design
   (`docs/wg-server.md` §8) — the storage bucket is the only durable
   state, so a fresh container on every scheduled invocation is correct,

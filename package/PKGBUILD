@@ -1,0 +1,59 @@
+# Maintainer: Trung Pham <trung.pham@zedercorp.com.vn>
+pkgname=wg-vpn
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Hub-and-spoke WireGuard fleet manager (wg-server + wg-client)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/pbtrung/wg-vpn"
+license=('MIT')
+depends=('wireguard-tools' 'iproute2' 'iputils' 'bash')
+backup=()
+install=wg-vpn.install
+
+source_x86_64=(
+    "https://github.com/pbtrung/wg-vpn/releases/download/v${pkgver}/wg-server-x86_64"
+    "https://github.com/pbtrung/wg-vpn/releases/download/v${pkgver}/wg-client-x86_64"
+)
+sha256sums_x86_64=(
+    'REPLACE_WG_SERVER_X86_64'
+    'REPLACE_WG_CLIENT_X86_64'
+)
+
+source_aarch64=(
+    "https://github.com/pbtrung/wg-vpn/releases/download/v${pkgver}/wg-server-aarch64"
+    "https://github.com/pbtrung/wg-vpn/releases/download/v${pkgver}/wg-client-aarch64"
+)
+sha256sums_aarch64=(
+    'REPLACE_WG_SERVER_AARCH64'
+    'REPLACE_WG_CLIENT_AARCH64'
+)
+
+source=(
+    'wg-server.service'
+    'wg-server.timer'
+    'wg-client.service'
+    'wg-client.timer'
+    "LICENSE::https://raw.githubusercontent.com/pbtrung/wg-vpn/v${pkgver}/LICENSE"
+)
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'REPLACE_LICENSE')
+
+package() {
+    install -Dm755 "${srcdir}/wg-server-${CARCH}" "${pkgdir}/usr/bin/wg-server"
+    install -Dm755 "${srcdir}/wg-client-${CARCH}" "${pkgdir}/usr/bin/wg-client"
+
+    install -Dm644 "${srcdir}/wg-server.service" \
+        "${pkgdir}/usr/lib/systemd/system/wg-server.service"
+    install -Dm644 "${srcdir}/wg-server.timer" \
+        "${pkgdir}/usr/lib/systemd/system/wg-server.timer"
+    install -Dm644 "${srcdir}/wg-client.service" \
+        "${pkgdir}/usr/lib/systemd/system/wg-client.service"
+    install -Dm644 "${srcdir}/wg-client.timer" \
+        "${pkgdir}/usr/lib/systemd/system/wg-client.timer"
+
+    # Config lives here, not shipped by the package -- see wg-vpn.install
+    # and README.md "Configure" for the schemas.
+    install -dm750 "${pkgdir}/etc/wg-server"
+    install -dm755 "${pkgdir}/etc/wg-client"
+
+    install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

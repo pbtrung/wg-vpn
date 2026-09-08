@@ -1,0 +1,30 @@
+post_install() {
+    getent group wg-server >/dev/null || groupadd --system wg-server
+    getent passwd wg-server >/dev/null || useradd --system --gid wg-server \
+        --no-create-home --shell /usr/bin/nologin \
+        --comment "wg-vpn server (apply)" wg-server
+    chown root:wg-server /etc/wg-server
+    chmod 750 /etc/wg-server
+
+    cat <<'EOF'
+==> wg-vpn installed. Next steps:
+    Server: put your topology JSON (README.md "Configure") at
+      /etc/wg-server/config.json, readable by the wg-server user, then:
+        sudo systemctl enable --now wg-server.timer
+    Client: put your client JSON at /etc/wg-client/config.json, then:
+        sudo systemctl enable --now wg-client.timer
+    Both timers/services also work with `systemctl start` for a one-off
+    run, and `journalctl -u wg-server.service` / `-u wg-client.service`
+    for logs.
+EOF
+}
+
+post_upgrade() {
+    post_install
+}
+
+post_remove() {
+    getent passwd wg-server >/dev/null && userdel wg-server
+    getent group wg-server >/dev/null && groupdel wg-server
+    true
+}

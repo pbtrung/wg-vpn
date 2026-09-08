@@ -1,0 +1,49 @@
+# Cross-compiles wg-server and wg-client for x86_64 and aarch64 Arch
+# Linux from a single amd64 builder host -- no buildx multi-platform
+# emulation needed -- using Arch's official aarch64-linux-gnu-gcc/glibc
+# cross toolchain (extra/aarch64-linux-gnu-*). Neither binary links
+# OpenSSL (aws-sdk-s3 here uses rustls), so there's no native C
+# dependency to cross-build besides libc itself.
+#
+# The builder clones its own source from git rather than reading the
+# local build context (same reasoning as docker/Dockerfile: a
+# reproducible, known ref rather than local uncommitted state). Export
+# just the resulting binaries with buildx's local exporter:
+#
+#   docker buildx build -f package/Dockerfile.build \
+#     --output type=local,dest=package/dist .
+#
+#   docker buildx build -f package/Dockerfile.build \
+#     --output type=local,dest=package/dist \
+#     --build-arg WG_VPN_REF=v1.2.3 .
+#
+# Produces:
+#   package/dist/x86_64/{wg-server,wg-client}
+#   package/dist/aarch64/{wg-server,wg-client}
+
+FROM archlinux:base-devel AS builder
+RUN pacman -Syu --noconfirm \
+    && pacman -S --noconfirm --needed rustup aarch64-linux-gnu-gcc git \
+    && rustup default stable \
+    && rustup target add aarch64-unknown-linux-gnu
+
+ARG WG_VPN_REPO=https://github.com/pbtrung/wg-vpn.git
+ARG WG_VPN_REF=main
+WORKDIR /build
+RUN git clone --depth 1 --branch "$WG_VPN_REF" "$WG_VPN_REPO" .
+
+# x86_64: native build.
+RUN cargo build --release --locked -p wg-server -p wg-client
+
+# aarch64: cross-compile, pointing cargo at the cross gcc as both the
+# linker and (via CC_<target>) the cc used by any build script.
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+RUN cargo build --release --locked --target aarch64-unknown-linux-gnu \
+    -p wg-server -p wg-client
+
+FROM scratch AS dist
+COPY --from=builder /build/target/release/wg-server /x86_64/wg-server
+COPY --from=builder /build/target/release/wg-client /x86_64/wg-client
+COPY --from=builder /build/target/aarch64-unknown-linux-gnu/release/wg-server /aarch64/wg-server
+COPY --from=builder /build/target/aarch64-unknown-linux-gnu/release/wg-client /aarch64/wg-client

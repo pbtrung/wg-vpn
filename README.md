@@ -23,8 +23,11 @@ wg-vpn/
 ├── wg-client/      # per-node binary: download and apply the config
 ├── docker/         # production image for running wg-server as a cloud
 │                   # cron job (see docker/README.md)
-└── docker-tests/   # Docker Compose harness with real kernel WireGuard
-                    # interfaces (see docker-tests/README.md)
+├── docker-tests/   # Docker Compose harness with real kernel WireGuard
+│                   # interfaces (see docker-tests/README.md)
+└── package/        # Arch Linux packaging: PKGBUILD, systemd units,
+                    # and the cross-build/release tooling behind it
+                    # (see "Install via package" below)
 ```
 
 ## Requirements
@@ -69,6 +72,34 @@ on Arch, so no separate DKMS package is needed — just confirm it loads
 cargo build --release
 # binaries land in target/release/wg-server and target/release/wg-client
 ```
+
+## Install via package (Arch Linux)
+
+Prebuilt `x86_64`/`aarch64` binaries plus `systemd` service/timer units
+are also available as an Arch package instead of building from source:
+
+```sh
+cd package
+makepkg -si
+```
+
+This installs `wg-server`/`wg-client` to `/usr/bin`, and
+`wg-server.{service,timer}`/`wg-client.{service,timer}` to run them on
+the daily schedule `docs/wg-server.md` assumes (`wg-server` at 00:00
+UTC, `wg-client` at 00:30 UTC). After installing, drop your config into
+`/etc/wg-server/config.json` and/or `/etc/wg-client/config.json` (see
+Configure below) and enable the relevant timer:
+
+```sh
+sudo systemctl enable --now wg-server.timer   # server hosts
+sudo systemctl enable --now wg-client.timer   # every node
+```
+
+See [`package/PKGBUILD`](package/PKGBUILD) for the package itself,
+[`package/Dockerfile.build`](package/Dockerfile.build) for how the
+release binaries are cross-built for both architectures from a single
+host, and [`package/release.sh`](package/release.sh) for the release
+process that ties the two together.
 
 ## Configure
 

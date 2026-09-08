@@ -1,0 +1,30 @@
+[Unit]
+Description=wg-vpn: publish WireGuard fleet configs (apply)
+Documentation=https://github.com/pbtrung/wg-vpn
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=wg-server
+Group=wg-server
+Environment=WG_SERVER_CONFIG=/etc/wg-server/config.json
+ExecStart=/usr/bin/wg-server apply
+
+# No key rotation by default: docs/wg-server.md says the routine
+# scheduled job must never pass --rotate (it can interrupt a live
+# tunnel until each node's wg-client next syncs). Rotate manually, e.g.:
+#   sudo -u wg-server WG_SERVER_CONFIG=/etc/wg-server/config.json \
+#     wg-server apply --rotate
+
+# Sandboxing: this binary only reads the config file and talks to the
+# bucket over the network, so it needs neither root nor write access to
+# most of the filesystem.
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ReadOnlyPaths=/etc/wg-server
+
+[Install]
+WantedBy=multi-user.target

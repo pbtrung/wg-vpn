@@ -1,0 +1,12 @@
+[Unit]
+Description=Run wg-server apply daily
+Documentation=https://github.com/pbtrung/wg-vpn
+
+[Timer]
+# Matches docs/wg-server.md §1's assumed schedule (0 0 * * * UTC).
+OnCalendar=*-*-* 00:00:00 UTC
+Persistent=true
+RandomizedDelaySec=5m
+
+[Install]
+WantedBy=timers.target

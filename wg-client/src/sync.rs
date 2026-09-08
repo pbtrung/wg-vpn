@@ -72,7 +72,8 @@ async fn discover_and_download<S: ReadStorage>(
     storage: &S,
     hostname: &str,
 ) -> Result<(String, String, Vec<u8>), String> {
-    for _ in 0..MAX_DISCOVERY_ROUNDS {
+    for round in 0..MAX_DISCOVERY_ROUNDS {
+        tracing::debug!(round, "fetching current.json");
         let current_bytes = storage
             .get_object("current.json")
             .await
@@ -92,15 +93,20 @@ async fn discover_and_download<S: ReadStorage>(
             })?
             .clone();
         let key = format!("nodes/{hostname}/{}.conf", current.id);
+        tracing::debug!(generation = %current.id, %key, "downloading generation file");
         match storage.get_object(&key).await.map_err(|e| e.to_string())? {
             Some(bytes) => {
                 let digest = digest_of(&bytes);
                 if digest != expected_digest {
                     return Err(format!("digest mismatch for {hostname:?}"));
                 }
+                tracing::debug!(generation = %current.id, %digest, "digest verified");
                 return Ok((current.id, digest, bytes));
             }
-            None => continue, // retired generation: rediscover current and retry
+            None => {
+                tracing::info!(generation = %current.id, "generation file missing, rediscovering");
+                continue; // retired generation: rediscover current and retry
+            }
         }
     }
     Err(format!(
@@ -119,14 +125,18 @@ async fn attempt_rollback<O: SystemOps>(
 ) {
     outcome.rollback_attempted = true;
     if !had_backup {
+        tracing::info!("no backup to roll back to (first install failure)");
         save_state(ops, state_path, state); // nothing to roll back to; pending stays set
         return;
     }
+    tracing::info!("restoring backup config");
     if ops.copy_file(backup_path, conf_path).is_err() {
+        tracing::warn!("failed to restore backup file during rollback");
         save_state(ops, state_path, state);
         return;
     }
     let ok = ops.wg_quick_up(conf_path).await.is_ok();
+    tracing::info!(rollback_succeeded = ok, "rollback wg-quick up attempted");
     outcome.rollback_succeeded = ok;
     if ok {
         state.pending = false;
@@ -144,12 +154,17 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
     conf_path: &Path,
     force: bool,
 ) -> SyncOutcome {
+    tracing::info!(hostname, iface, force, "starting sync pass");
     let state_path = state_path_for(conf_path);
     let backup_path = backup_path_for(conf_path);
     let mut outcome = SyncOutcome::default();
     let mut state = load_state(ops, &state_path);
 
     if state.pending {
+        tracing::info!(
+            had_backup = state.had_backup_before_pending,
+            "recovering pending transaction from a previous run"
+        );
         outcome.recovered_pending = true;
         if state.had_backup_before_pending && ops.file_exists(&backup_path) {
             let _ = ops.copy_file(&backup_path, conf_path);
@@ -164,6 +179,7 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
     let (generation_id, digest, bytes) = match discover_and_download(storage, hostname).await {
         Ok(v) => v,
         Err(e) => {
+            tracing::debug!(error = %e, "discovery/download failed");
             outcome.error = Some(e);
             return outcome;
         }
@@ -179,10 +195,12 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
         && state.applied_digest.as_deref() == Some(digest.as_str())
         && ops.interface_exists(iface);
     if unchanged {
+        tracing::debug!(generation = %generation_id, "content unchanged and interface up, no-op");
         outcome.no_op = true;
         return outcome;
     }
 
+    tracing::info!(generation = %generation_id, "applying new configuration");
     let had_backup = ops.file_exists(conf_path);
     if had_backup && let Err(e) = ops.copy_file(conf_path, &backup_path) {
         outcome.error = Some(format!("failed to back up current config: {e}"));
@@ -192,11 +210,12 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
     state.had_backup_before_pending = had_backup;
     save_state(ops, &state_path, &state);
 
-    if ops.interface_exists(iface)
-        && let Err(e) = ops.wg_quick_down(conf_path).await
-    {
-        outcome.error = Some(format!("wg-quick down failed: {e}"));
-        return outcome; // pending stays set; next run recovers from the backup
+    if ops.interface_exists(iface) {
+        tracing::debug!(iface, "tearing down interface before install");
+        if let Err(e) = ops.wg_quick_down(conf_path).await {
+            outcome.error = Some(format!("wg-quick down failed: {e}"));
+            return outcome; // pending stays set; next run recovers from the backup
+        }
     }
 
     if let Err(e) = ops.write_file_atomic(conf_path, &bytes) {

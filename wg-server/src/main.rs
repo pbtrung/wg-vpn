@@ -17,28 +17,58 @@ struct Cli {
     verbose: u8,
 }
 
+/// The topology config path can come from `--config`, or from this
+/// environment variable — so the binary can run unmodified as a cloud
+/// cron job with the path injected via environment. `--config` wins if
+/// both are set.
+const CONFIG_ENV_VAR: &str = "WG_SERVER_CONFIG";
+
 #[derive(Subcommand)]
 enum Command {
     /// Generate/reuse keys, render configs, and publish a new generation
     /// if anything changed.
     Apply {
+        /// Path to the topology JSON. Falls back to WG_SERVER_CONFIG if
+        /// not given.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
         #[arg(long)]
         dry_run: bool,
         /// Force a fresh key for the named node(s) (repeatable), or for
         /// every node if given with no value. Cannot mix both forms.
         #[arg(long, num_args = 0..=1, default_missing_value = "")]
         rotate: Vec<String>,
+        /// Force immediate cleanup of any generation that is neither
+        /// current nor previous, bypassing the default 15-minute grace
+        /// period. Cleanup always runs on every apply; this only removes
+        /// the delay, so use it when you know no concurrent apply is in
+        /// flight (e.g. interactive/manual use) rather than routinely.
+        #[arg(long)]
+        prune: bool,
     },
     /// Validate the topology config only; no key handling, no network.
     Validate {
+        /// Path to the topology JSON. Falls back to WG_SERVER_CONFIG if
+        /// not given.
         #[arg(long)]
-        config: PathBuf,
+        config: Option<PathBuf>,
     },
 }
 
+/// Resolves `--config`, falling back to `WG_SERVER_CONFIG` so the same
+/// binary can run as a cloud cron job with the path injected via
+/// environment rather than a fixed CLI argument (docs/wg-server.md §1).
+fn resolve_config_path(cli_value: Option<PathBuf>) -> anyhow::Result<PathBuf> {
+    if let Some(path) = cli_value {
+        return Ok(path);
+    }
+    std::env::var_os(CONFIG_ENV_VAR)
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("--config not given and {CONFIG_ENV_VAR} is not set"))
+}
+
 fn read_config(path: &PathBuf) -> anyhow::Result<wg_common::topology::TopologyConfig> {
+    tracing::debug!(path = %path.display(), "reading topology config");
     let text = std::fs::read_to_string(path)?;
     wg_common::topology::parse(&text).map_err(|e| anyhow::anyhow!("{e}"))
 }
@@ -85,34 +115,56 @@ async fn main() -> ExitCode {
         .init();
 
     match cli.command {
-        Command::Validate { config } => match read_config(&config) {
-            Ok(cfg) => match wg_common::topology::validate(&cfg) {
-                Ok((topo, warnings)) => {
-                    for w in &warnings {
-                        tracing::warn!("{w}");
-                    }
-                    println!(
-                        "OK: {} nodes, {} edges",
-                        topo.nodes.len(),
-                        topo.edges().len()
-                    );
-                    ExitCode::SUCCESS
-                }
+        Command::Validate { config } => {
+            let config = match resolve_config_path(config) {
+                Ok(c) => c,
                 Err(e) => {
-                    eprintln!("validation error: {e}");
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            match read_config(&config) {
+                Ok(cfg) => match wg_common::topology::validate(&cfg) {
+                    Ok((topo, warnings)) => {
+                        tracing::info!(
+                            nodes = topo.nodes.len(),
+                            edges = topo.edges().len(),
+                            "validated"
+                        );
+                        for w in &warnings {
+                            tracing::warn!("{w}");
+                        }
+                        println!(
+                            "OK: {} nodes, {} edges",
+                            topo.nodes.len(),
+                            topo.edges().len()
+                        );
+                        ExitCode::SUCCESS
+                    }
+                    Err(e) => {
+                        eprintln!("validation error: {e}");
+                        ExitCode::FAILURE
+                    }
+                },
+                Err(e) => {
+                    eprintln!("config error: {e}");
                     ExitCode::FAILURE
                 }
-            },
-            Err(e) => {
-                eprintln!("config error: {e}");
-                ExitCode::FAILURE
             }
-        },
+        }
         Command::Apply {
             config,
             dry_run,
             rotate,
+            prune,
         } => {
+            let config = match resolve_config_path(config) {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
             let cfg = match read_config(&config) {
                 Ok(c) => c,
                 Err(e) => {
@@ -127,16 +179,56 @@ async fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
+            tracing::info!(
+                nodes = cfg.nodes.len(),
+                masters = cfg.master.len(),
+                dry_run,
+                prune,
+                rotate = ?rotate,
+                "starting apply"
+            );
             let client = storage::R2Client::new(&cfg.r2_config);
             let opts = apply::ApplyOptions {
                 dry_run,
                 rotate,
-                ..Default::default()
+                grace_period: if prune {
+                    std::time::Duration::ZERO
+                } else {
+                    apply::ApplyOptions::default().grace_period
+                },
             };
             match apply::apply(&client, &cfg, &opts).await {
                 Ok(report) => {
                     for w in &report.warnings {
                         tracing::warn!("{w}");
+                    }
+                    tracing::info!(
+                        reused = report.reused_hostnames.len(),
+                        freshly_keyed = report.freshly_keyed_hostnames.len(),
+                        "key resolution"
+                    );
+                    tracing::debug!(
+                        reused = ?report.reused_hostnames,
+                        freshly_keyed = ?report.freshly_keyed_hostnames,
+                        "key resolution detail"
+                    );
+                    if report.published {
+                        tracing::info!(
+                            generation = ?report.new_generation_id,
+                            uploaded = report.uploaded_hostnames.len(),
+                            "published a new generation"
+                        );
+                    } else {
+                        tracing::info!("no change; nothing published");
+                    }
+                    if !report.cleanup_deleted.is_empty()
+                        || !report.cleanup_skipped_within_grace.is_empty()
+                    {
+                        tracing::info!(
+                            deleted = ?report.cleanup_deleted,
+                            skipped_within_grace = report.cleanup_skipped_within_grace.len(),
+                            "retention cleanup"
+                        );
                     }
                     println!(
                         "reused={} freshly_keyed={} published={} generation={:?} uploaded={} cleanup_deleted={} cleanup_skipped_within_grace={}",

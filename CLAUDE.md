@@ -39,6 +39,10 @@ decision changes, update the doc in the same change, not as a follow-up.
   was actually found (a panicking `aws-sdk-s3` credentials call that
   every mocked unit test was blind to) — don't skip it when touching the
   storage or key-application paths.
+- `docker/` — a *different* thing from `docker-tests/`: the production
+  image for running `wg-server apply` as a scheduled cloud cron job
+  (distroless, config path from `WG_SERVER_CONFIG`). Don't confuse the
+  two directories.
 
 ## Testing pattern
 

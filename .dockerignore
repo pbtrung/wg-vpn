@@ -1,0 +1,6 @@
+target/
+.git/
+.claude/
+docker-tests/
+docker/
+*.md

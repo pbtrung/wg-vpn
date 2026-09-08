@@ -21,6 +21,8 @@ wg-vpn/
 │                   # validation, Base32 encoding, discovery schema
 ├── wg-server/      # control-plane binary: generate/rotate keys, publish
 ├── wg-client/      # per-node binary: download and apply the config
+├── docker/         # production image for running wg-server as a cloud
+│                   # cron job (see docker/README.md)
 └── docker-tests/   # Docker Compose harness with real kernel WireGuard
                     # interfaces (see docker-tests/README.md)
 ```
@@ -140,6 +142,18 @@ wg-server apply --config topology.json
 # Force a fresh key for one node (repeatable), or --rotate alone for
 # every node.
 wg-server apply --config topology.json --rotate workstation-01
+
+# Cleanup of old generations always runs automatically (keeping only the
+# current and one previous generation), but waits out a 15-minute grace
+# period by default. --prune forces it immediately -- useful when you're
+# testing/iterating and don't want to wait, or know no other apply is
+# running concurrently.
+wg-server apply --config topology.json --prune
+
+# --config can be omitted if WG_SERVER_CONFIG is set instead -- this is
+# what lets the same binary run unmodified as a cloud cron job (see
+# docker/README.md).
+WG_SERVER_CONFIG=topology.json wg-server apply
 
 # On each node: download and apply this node's current published config.
 sudo wg-client sync --config client.json --once

@@ -37,6 +37,30 @@ wg-vpn/
 - Docker, only for `docker-tests/` (an end-to-end harness against real
   WireGuard interfaces, not required to build or unit-test the project).
 
+### Arch Linux packages
+
+`wg-server` only needs a Rust toolchain to build and run. `wg-client`
+additionally needs the real WireGuard/networking tools on any host it
+manages an interface on:
+
+```sh
+# Build toolchain (either binary):
+sudo pacman -S rust
+
+# Runtime, wg-client hosts only:
+sudo pacman -S wireguard-tools iproute2 iputils bash
+
+# Only for docker-tests/:
+sudo pacman -S docker docker-compose
+```
+
+`wireguard-tools` provides `wg`/`wg-quick`; `iproute2` provides `ip`;
+`iputils` provides `ping` (used by `docker-tests/`, not by the binaries
+themselves); `bash` is required because `wg-quick` itself is a Bash
+script. The `wireguard` kernel module ships in the mainline Linux kernel
+on Arch, so no separate DKMS package is needed — just confirm it loads
+(`sudo modprobe wireguard`).
+
 ## Build
 
 ```sh
@@ -64,12 +88,44 @@ like:
     "bucket": "wg-confs"
   },
   "nodes": [
-    { "hostname": "master-us", "wg_config": { "tunnel_address": "10.10.0.1/32", "endpoint": "203.0.113.10:51820" } },
-    { "hostname": "workstation-01", "wg_config": { "tunnel_address": "10.10.0.100/32" } }
+    {
+      "hostname": "master-us",
+      "wg_config": {
+        "tunnel_address": "10.10.0.1/32",
+        "endpoint": "203.0.113.10:51820"
+      }
+    },
+    {
+      "hostname": "workstation-01",
+      "wg_config": {
+        "tunnel_address": "10.10.0.100/32"
+      }
+    }
   ],
   "master": ["master-us"]
 }
 ```
+
+Each node then gets its own small client config, e.g. for `workstation-01`:
+
+```json
+{
+  "r2_config": {
+    "endpoint": "https://<accountid>.r2.cloudflarestorage.com",
+    "read_only_access_key_id": "...",
+    "read_only_secret_access_key": "...",
+    "region": "auto",
+    "bucket": "wg-confs"
+  },
+  "conf_path": "/etc/wireguard/wg0.conf"
+}
+```
+
+The node's own hostname (`workstation-01` here) is resolved from
+`--hostname`, the `WG_CLIENT_HOSTNAME` environment variable, or the
+system hostname, in that order — it isn't part of this file, so the same
+config can be reused across hosts (see
+[`docs/wg-client.md` §5](docs/wg-client.md)).
 
 ## Use
 

@@ -1,6 +1,6 @@
 # Maintainer: Trung Pham <trung.pham@zedercorp.com.vn>
 pkgname=wg-vpn
-pkgver=0.1.0
+pkgver=0.1.1
 pkgrel=1
 pkgdesc="Hub-and-spoke WireGuard fleet manager (wg-server + wg-client)"
 arch=('x86_64' 'aarch64')
@@ -9,12 +9,22 @@ license=('MIT')
 depends=('wireguard-tools' 'iproute2' 'iputils' 'bash')
 backup=()
 install=wg-vpn.install
+# Prebuilt binaries from a separate release build, not compiled here --
+# there's no matching source for makepkg's automatic debug package to
+# correlate against, and gdb-add-index fails on their (release-profile,
+# already near-stripped) debug info anyway.
+options=('!strip' '!debug')
 
 source_x86_64=("https://github.com/pbtrung/wg-vpn/releases/download/v${pkgver}/wg-vpn-x86_64.tar.gz")
-sha256sums_x86_64=('REPLACE_WG_VPN_X86_64')
+sha256sums=('6ea069ee51ffd204e68b66cb4263067a4c40b4c67fa266ad157d3adce609c423'
+            '4457edd2fdd412be0dc4fae872817f1806e4277321e013f3d3d09892c1ec4494'
+            '9cf0c99b68b5506e3f237866c3f76723bd27a662ab1a6e62e795f813ec04792d'
+            '6922f7960b51ef44317b3cf754d763080cb22b9d43210098135f7b5a7bdc7dc2'
+            '43ee3a03927f51dcf681554acbc6e2668dca58fc896001530f5cbfb2fe95af27')
+sha256sums_x86_64=('6ec7ff899da6ab7c6ed43bb0a985d8358bbf2c4fa13e5483df7a32354b049db9')
+sha256sums_aarch64=('3dba2ddc549e1d6ba4f8a40997129747648c2e6287db018af01936b9a0ec2dc9')
 
 source_aarch64=("https://github.com/pbtrung/wg-vpn/releases/download/v${pkgver}/wg-vpn-aarch64.tar.gz")
-sha256sums_aarch64=('REPLACE_WG_VPN_AARCH64')
 
 source=(
     'wg-server.service'
@@ -23,7 +33,6 @@ source=(
     'wg-client.timer'
     "LICENSE::https://raw.githubusercontent.com/pbtrung/wg-vpn/v${pkgver}/LICENSE"
 )
-sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'REPLACE_LICENSE')
 
 package() {
     # makepkg auto-extracts the arch-specific wg-vpn-$CARCH.tar.gz

@@ -3,6 +3,13 @@
 *.pdb
 /package/dist/
 
+# makepkg build artifacts (running `makepkg` inside package/ directly)
+/package/pkg/
+/package/src/
+/package/*.pkg.tar.*
+/package/*.tar.gz
+/package/LICENSE
+
 # Editor/IDE
 .idea/
 .vscode/

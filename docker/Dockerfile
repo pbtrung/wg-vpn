@@ -26,7 +26,8 @@ ARG WG_VPN_REPO=https://github.com/pbtrung/wg-vpn.git
 ARG WG_VPN_REF=main
 WORKDIR /build
 RUN git clone --depth 1 --branch "$WG_VPN_REF" "$WG_VPN_REPO" .
-RUN cargo build --release --locked -p wg-server
+RUN cargo build --release --locked -p wg-server \
+    && strip target/release/wg-server
 
 FROM alpine:edge
 RUN apk update && apk --no-cache upgrade

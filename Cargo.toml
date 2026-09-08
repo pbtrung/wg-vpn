@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["src/wg-common", "src/wg-server", "src/wg-client"]
+members = ["wg-common", "wg-server", "wg-client"]
 
 [workspace.package]
 edition = "2024"
@@ -27,4 +27,4 @@ fd-lock = "4.0.4"
 aws-sdk-s3 = "1.145.0"
 aws-config = "1.12.0"
 
-wg-common = { path = "src/wg-common" }
+wg-common = { path = "wg-common" }

@@ -17,7 +17,7 @@ REPO_ROOT="$(cd .. && pwd)"
 FAILED=0
 KEEP=${KEEP:-0}
 
-log() { echo "[network-sim] $*"; }
+log() { echo "[docker-tests] $*"; }
 pass() { echo "  PASS: $*"; }
 fail() { echo "  FAIL: $*"; FAILED=1; }
 

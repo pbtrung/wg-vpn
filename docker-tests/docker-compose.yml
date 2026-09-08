@@ -1,4 +1,4 @@
-name: wg-network-sim
+name: wg-docker-tests
 
 services:
   minio:
@@ -29,7 +29,7 @@ services:
   server:
     build:
       context: ..
-      dockerfile: network-sim/Dockerfile.server
+      dockerfile: docker-tests/Dockerfile.server
     depends_on:
       bucket-init:
         condition: service_completed_successfully
@@ -41,7 +41,7 @@ services:
   master-us:
     build:
       context: ..
-      dockerfile: network-sim/Dockerfile.client
+      dockerfile: docker-tests/Dockerfile.client
     hostname: master-us
     cap_add: [NET_ADMIN]
     entrypoint: ["sleep", "infinity"]
@@ -52,7 +52,7 @@ services:
   master-eu:
     build:
       context: ..
-      dockerfile: network-sim/Dockerfile.client
+      dockerfile: docker-tests/Dockerfile.client
     hostname: master-eu
     cap_add: [NET_ADMIN]
     entrypoint: ["sleep", "infinity"]
@@ -63,7 +63,7 @@ services:
   workstation-01:
     build:
       context: ..
-      dockerfile: network-sim/Dockerfile.client
+      dockerfile: docker-tests/Dockerfile.client
     hostname: workstation-01
     cap_add: [NET_ADMIN]
     entrypoint: ["sleep", "infinity"]
@@ -74,7 +74,7 @@ services:
   mobile-01:
     build:
       context: ..
-      dockerfile: network-sim/Dockerfile.client
+      dockerfile: docker-tests/Dockerfile.client
     hostname: mobile-01
     cap_add: [NET_ADMIN]
     entrypoint: ["sleep", "infinity"]

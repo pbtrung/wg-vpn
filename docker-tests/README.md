@@ -16,7 +16,7 @@ directly.
   `docs/milestones.md` §4 "Supported execution mode" — this needs the
   `wireguard` kernel module already loaded on the host, not inside the
   container).
-- `network-sim/Dockerfile.{server,client}` copy a **host-built** release
+- `docker-tests/Dockerfile.{server,client}` copy a **host-built** release
   binary rather than compiling inside Docker, and use an `archlinux`
   runtime image to match the host's glibc. If your host isn't
   Arch-compatible, switch the base image and drop the host-binary copy

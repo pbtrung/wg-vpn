@@ -41,8 +41,9 @@ decision changes, update the doc in the same change, not as a follow-up.
   storage or key-application paths.
 - `docker/` — a *different* thing from `docker-tests/`: the production
   image for running `wg-server apply` as a scheduled cloud cron job
-  (distroless, config path from `WG_SERVER_CONFIG`). Don't confuse the
-  two directories.
+  (`alpine:edge` for both build and runtime stages — musl libc, so don't
+  copy in a glibc-built binary; config path from `WG_SERVER_CONFIG`).
+  Don't confuse the two directories.
 
 ## Testing pattern
 

@@ -37,19 +37,36 @@ container args is appended, so a one-off dry run or rotation looks like:
 
 ```sh
 docker run --rm -e WG_SERVER_CONFIG=... -v ...:... wg-server --dry-run
+
+# Rotate one node's key (repeatable), or every node with a bare --rotate.
+# Either form always cleans up immediately (skips the usual ~15-minute
+# retention grace period), since rotation is already a deliberate,
+# manual action rather than the routine unattended cron invocation.
 docker run --rm -e WG_SERVER_CONFIG=... -v ...:... wg-server --rotate workstation-01
+docker run --rm -e WG_SERVER_CONFIG=... -v ...:... wg-server --rotate
+
+# More verbose logs (-v info, -vv debug, -vvv trace) -- or set
+# -e RUST_LOG=debug instead, which takes priority if both are given.
+docker run --rm -e WG_SERVER_CONFIG=... -v ...:... wg-server -v
 ```
 
-Set `-e RUST_LOG=info` (or `-e RUST_LOG=debug`) for more verbose logs —
-see the root [`README.md`](../README.md#use) for the logging flags this
-binary also accepts directly (`-v`/`-vv`/`-vvv`), which work the same way
-here as `docker run ... wg-server -v --dry-run`.
+Flags combine normally, e.g. `wg-server --rotate -v` for a verbose
+full-fleet rotation (`--prune` is redundant here since `--rotate` already
+implies it, but harmless to add).
 
 ## Notes
 
-- The image is `distroless` (no shell, no package manager) — if you need
-  to debug interactively, use `docker run --rm -it --entrypoint sh
-  <a non-distroless build>` instead, or add a debug stage.
+- The runtime image is `alpine:edge`, rebuilt from source in an
+  `alpine:edge` builder stage too (matching musl libc — a binary built
+  against glibc, e.g. from a Debian-based builder, will not run here).
+  Both stages run `apk update && apk --no-cache upgrade` before
+  installing anything, so rebuilding regularly picks up upstream
+  security patches rather than pinning to whatever was current when the
+  image was last built. `edge` (Alpine's rolling branch) rather than a
+  numbered release so those upgrades actually have newer packages to
+  pull from.
+- Debug interactively with `docker run --rm -it --entrypoint sh
+  wg-server` (Alpine's `sh` is available, unlike a distroless image).
 - Nothing in this image persists between runs by design
   (`docs/wg-server.md` §8) — the storage bucket is the only durable
   state, so a fresh container on every scheduled invocation is correct,

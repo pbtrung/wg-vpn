@@ -80,7 +80,7 @@ are also available as an Arch package instead of building from source:
 
 ```sh
 cd package
-makepkg -si
+makepkg
 ```
 
 This installs `wg-server`/`wg-client` to `/usr/bin`, and
@@ -98,6 +98,21 @@ relevant timer:
 sudo systemctl enable --now wg-server.timer   # server hosts
 sudo systemctl enable --now wg-client.timer   # every node
 ```
+
+On client hosts you **must** also enable `wg-quick@wg0` (substitute
+your actual interface name if `conf_path` isn't `wg0.conf`):
+
+```sh
+sudo systemctl enable --now wg-quick@wg0
+```
+
+`wg-client.timer` only re-syncs *content changes* — if the currently
+published generation's digest matches what was last applied, `sync`
+no-ops without touching the interface at all (`wg-client/src/sync.rs`).
+That means after a reboot, with the tunnel down but the digest
+unchanged, `wg-client.timer` alone won't bring it back up until the
+generation next actually changes; `wg-quick@wg0` is what restores the
+tunnel immediately at boot from the config `wg-client` already wrote.
 
 See [`package/PKGBUILD`](package/PKGBUILD) for the package itself,
 [`package/Dockerfile.build`](package/Dockerfile.build) for how the

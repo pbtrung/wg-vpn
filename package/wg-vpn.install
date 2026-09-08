@@ -13,6 +13,11 @@ post_install() {
         sudo systemctl enable --now wg-server.timer
     Client: put your client JSON at /etc/wg-client/config.json, then:
         sudo systemctl enable --now wg-client.timer
+        sudo systemctl enable --now wg-quick@wg0   # MUST also enable this
+    wg-client.timer only re-syncs content changes -- it won't bring the
+    interface back up after a reboot on its own. wg-quick@wg0 is what
+    restores the tunnel at boot from the config wg-client already wrote
+    (substitute your actual interface name if conf_path isn't wg0.conf).
     Both timers/services also work with `systemctl start` for a one-off
     run, and `journalctl -u wg-server.service` / `-u wg-client.service`
     for logs.

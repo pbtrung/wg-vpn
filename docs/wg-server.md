@@ -59,11 +59,11 @@ active uploader's files.
 ```
 wg-vpn/
 ├── Cargo.toml                  # workspace root
-├── crates/
-│   ├── wg-common/              # shared: S3 client wrapper, wg-quick renderer,
-│   │                           # config types, error types
-│   ├── wg-server/              # this binary
-│   └── wg-client/              # sibling binary — docs/wg-client.md
+├── src/
+│   ├── wg-common/               # shared: S3 client wrapper, wg-quick renderer,
+│   │                            # config types, error types
+│   ├── wg-server/               # this binary
+│   └── wg-client/               # sibling binary — docs/wg-client.md
 └── docs/
     ├── wg-server.md
     └── wg-client.md

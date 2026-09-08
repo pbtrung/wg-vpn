@@ -1,0 +1,15 @@
+/target/
+**/*.rs.bk
+*.pdb
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Env/local config
+.env
+.env.local

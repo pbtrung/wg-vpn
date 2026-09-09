@@ -1,9 +1,12 @@
 # wg-vpn
 
 A small hub-and-spoke WireGuard fleet manager: `wg-server` generates keys
-and publishes per-node `wg-quick` configs to an S3-compatible bucket
-(Cloudflare R2 in the reference deployment); `wg-client` runs on every
-node, downloads its own config, and brings the tunnel up.
+and publishes per-node configs (in `wg-quick`-compatible INI syntax, used
+only as a storage format) to an S3-compatible bucket (Cloudflare R2 in
+the reference deployment); `wg-client` runs on every node, downloads its
+own config, and brings the tunnel up by configuring the kernel interface
+directly over netlink/UAPI — the way [innernet](https://github.com/tonarino/innernet)
+does — rather than shelling out to `wg`/`wg-quick`.
 
 Topology rule: every master reaches every node and every other master;
 non-master nodes only reach masters, never each other.
@@ -34,9 +37,10 @@ wg-vpn/
 
 - Rust (edition 2024; a recent stable toolchain — this was built and
   tested against 1.98).
-- `wg-client` shells out to the real `wg-quick`/`wg`/`ip` tools at
-  runtime and needs root (or `CAP_NET_ADMIN` plus the rest of
-  `wg-quick`'s prerequisites) to manage an interface.
+- `wg-client` configures the kernel WireGuard interface itself over
+  netlink/UAPI and needs `CAP_NET_ADMIN` to do so (root is the simplest
+  way to get that; see [`docs/wg-client.md` §8](docs/wg-client.md)). No
+  `wg`/`wg-quick`/`ip` binary or Bash is required at runtime.
 - An S3-compatible bucket (Cloudflare R2, or anything else that supports
   conditional writes — see [`docs/wg-server.md` §10](docs/wg-server.md)).
 - Docker, only for `docker-tests/` (an end-to-end harness against real
@@ -44,26 +48,26 @@ wg-vpn/
 
 ### Arch Linux packages
 
-`wg-server` only needs a Rust toolchain to build and run. `wg-client`
-additionally needs the real WireGuard/networking tools on any host it
-manages an interface on:
+Both binaries only need a Rust toolchain to build and run — `wg-client`
+included, since it needs no external WireGuard/networking tools at
+runtime:
 
 ```sh
 # Build toolchain (either binary):
 sudo pacman -S rust
 
-# Runtime, wg-client hosts only:
-sudo pacman -S wireguard-tools iproute2 iputils bash
+# Optional, wg-client hosts only, for manual inspection:
+sudo pacman -S wireguard-tools iproute2
 
 # Only for docker-tests/:
 sudo pacman -S docker docker-compose
 ```
 
-`wireguard-tools` provides `wg`/`wg-quick`; `iproute2` provides `ip`;
-`iputils` provides `ping` (used by `docker-tests/`, not by the binaries
-themselves); `bash` is required because `wg-quick` itself is a Bash
-script. The `wireguard` kernel module ships in the mainline Linux kernel
-on Arch, so no separate DKMS package is needed — just confirm it loads
+`wireguard-tools` provides `wg show`; `iproute2` provides `ip addr`/`ip
+route` — both purely for an operator inspecting the interface by hand
+(`package/PKGBUILD`'s `optdepends`), not required by `wg-client` itself.
+The `wireguard` kernel module ships in the mainline Linux kernel on Arch,
+so no separate DKMS package is needed — just confirm it loads
 (`sudo modprobe wireguard`).
 
 ## Build
@@ -238,4 +242,5 @@ cd docker-tests && ./run.sh
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT — see [`LICENSE`](LICENSE). The compiled `wg-client` binary also
+links an LGPL-2.1-or-later component; see [`NOTICE.md`](NOTICE.md).

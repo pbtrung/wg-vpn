@@ -1,4 +1,5 @@
 mod config;
+mod netlink;
 mod storage;
 mod sync;
 mod system;
@@ -141,6 +142,9 @@ async fn run_sync_pass(
 fn report(outcome: &sync::SyncOutcome) {
     if outcome.recovered_pending {
         tracing::warn!("recovered from an interrupted previous transaction");
+    }
+    if outcome.restored_local {
+        tracing::warn!("interface was missing at pass start; restored from last-good local config");
     }
     if let Some(err) = &outcome.error {
         tracing::error!("sync failed: {err}");

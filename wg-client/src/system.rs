@@ -1,8 +1,16 @@
 //! Host operations `sync`'s algorithm needs (files, locking-adjacent
-//! checks, and `wg-quick` invocation), behind a trait so the state
-//! machine can be tested with an in-memory fake instead of touching a
-//! real filesystem/interface (wg-client.md §6, tested this way per
-//! docs/milestones.md §3 "an explicit host-operation test adapter").
+//! checks, and WireGuard interface configuration), behind a trait so the
+//! state machine can be tested with an in-memory fake instead of
+//! touching a real filesystem/interface (wg-client.md §6, tested this
+//! way per docs/milestones.md §3 "an explicit host-operation test
+//! adapter").
+//!
+//! `RealSystemOps` configures the kernel interface directly over
+//! netlink/UAPI via the `wireguard-control` crate (keys/peers) plus this
+//! crate's own `netlink` module (address/link/route) -- the way
+//! [innernet](https://github.com/tonarino/innernet) does it -- rather
+//! than shelling out to `wg`/`wg-quick`. See NOTICE.md for the licensing
+//! consequence of depending on `wireguard-control`.
 
 use std::path::{Path, PathBuf};
 
@@ -20,8 +28,15 @@ pub trait SystemOps {
     /// Whether a WireGuard interface named `iface` currently exists.
     fn interface_exists(&self, iface: &str) -> bool;
 
-    async fn wg_quick_up(&self, conf_path: &Path) -> Result<(), String>;
-    async fn wg_quick_down(&self, conf_path: &Path) -> Result<(), String>;
+    /// Configure the interface (creating it if absent) exactly per the
+    /// parsed contents of `conf_path`: private key, listen port, the
+    /// full peer set (replacing whatever peers were there before),
+    /// tunnel address, MTU, and routes for every peer's `AllowedIPs`.
+    async fn apply_interface(&self, iface: &str, conf_path: &Path) -> Result<(), String>;
+
+    /// Remove the interface entirely (kernel cleans up its addresses
+    /// and routes as part of deleting the link).
+    async fn teardown_interface(&self, iface: &str) -> Result<(), String>;
 }
 
 pub struct RealSystemOps;
@@ -68,15 +83,137 @@ impl SystemOps for RealSystemOps {
     }
 
     fn interface_exists(&self, iface: &str) -> bool {
-        Path::new("/sys/class/net").join(iface).exists()
+        // Query the kernel directly, the same way innernet's
+        // interface_is_up() re-checks Device::list() on every call
+        // rather than trusting a cached/filesystem-based answer.
+        match iface.parse::<wireguard_control::InterfaceName>() {
+            Ok(name) => wireguard_control::Device::list(wireguard_control::Backend::Kernel)
+                .map(|ifaces| ifaces.contains(&name))
+                .unwrap_or(false),
+            Err(_) => false,
+        }
     }
 
-    async fn wg_quick_up(&self, conf_path: &Path) -> Result<(), String> {
-        run_wg_quick("up", conf_path).await
+    async fn apply_interface(&self, iface: &str, conf_path: &Path) -> Result<(), String> {
+        let bytes = std::fs::read(conf_path).map_err(|e| format!("read {conf_path:?}: {e}"))?;
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        let cfg = wg_common::render::parse_wg_quick(&text)
+            .map_err(|e| format!("parse {conf_path:?}: {e}"))?;
+
+        // Resolve endpoint names before handing off to the blocking
+        // netlink/UAPI work below (wg-client.md §6: "resolve endpoint
+        // names with a finite deadline" before touching the interface).
+        let mut endpoints = Vec::with_capacity(cfg.peers.len());
+        for peer in &cfg.peers {
+            endpoints.push(match &peer.endpoint {
+                Some(endpoint) => Some(resolve_endpoint(endpoint).await?),
+                None => None,
+            });
+        }
+
+        let iface = iface.to_string();
+        tokio::task::spawn_blocking(move || apply_interface_blocking(&iface, &cfg, &endpoints))
+            .await
+            .map_err(|e| format!("interface apply task panicked: {e}"))?
     }
 
-    async fn wg_quick_down(&self, conf_path: &Path) -> Result<(), String> {
-        run_wg_quick("down", conf_path).await
+    async fn teardown_interface(&self, iface: &str) -> Result<(), String> {
+        let iface = iface.to_string();
+        tokio::task::spawn_blocking(move || teardown_interface_blocking(&iface))
+            .await
+            .map_err(|e| format!("interface teardown task panicked: {e}"))?
+    }
+}
+
+/// Resolve a `host:port`/`ip:port` endpoint string with a finite
+/// deadline (wg-client.md §6). Picks the first resolved address.
+async fn resolve_endpoint(endpoint: &str) -> Result<std::net::SocketAddr, String> {
+    let lookup = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::lookup_host(endpoint),
+    )
+    .await
+    .map_err(|_| format!("resolving endpoint {endpoint:?} timed out"))?
+    .map_err(|e| format!("resolving endpoint {endpoint:?}: {e}"))?;
+    lookup
+        .into_iter()
+        .next()
+        .ok_or_else(|| format!("endpoint {endpoint:?} resolved to no addresses"))
+}
+
+/// The synchronous netlink/UAPI work behind [`RealSystemOps::apply_interface`],
+/// run on a blocking thread since these are ordinary blocking syscalls,
+/// not async I/O.
+fn apply_interface_blocking(
+    iface: &str,
+    cfg: &wg_common::render::ParsedConfig,
+    endpoints: &[Option<std::net::SocketAddr>],
+) -> Result<(), String> {
+    let name: wireguard_control::InterfaceName = iface
+        .parse()
+        .map_err(|e| format!("invalid interface name {iface:?}: {e}"))?;
+
+    let private_key = wireguard_control::Key::from_base64(&cfg.interface.private_key)
+        .map_err(|_| "invalid private key".to_string())?;
+
+    let mut update = wireguard_control::DeviceUpdate::new()
+        .set_private_key(private_key)
+        .set_listen_port(cfg.interface.listen_port)
+        .replace_peers();
+
+    for (peer, endpoint) in cfg.peers.iter().zip(endpoints) {
+        let public_key = wireguard_control::Key::from_base64(&peer.public_key)
+            .map_err(|_| "invalid peer public key".to_string())?;
+        let preshared_key = wireguard_control::Key::from_base64(&peer.preshared_key)
+            .map_err(|_| "invalid peer preshared key".to_string())?;
+
+        let mut builder = wireguard_control::PeerConfigBuilder::new(&public_key)
+            .set_preshared_key(preshared_key)
+            .replace_allowed_ips();
+        for net in &peer.allowed_ips {
+            builder = builder.add_allowed_ip(std::net::IpAddr::V4(net.network()), net.prefix_len());
+        }
+        if let Some(keepalive) = peer.persistent_keepalive {
+            builder = builder.set_persistent_keepalive_interval(keepalive);
+        }
+        if let Some(endpoint) = endpoint {
+            builder = builder.set_endpoint(*endpoint);
+        }
+        update = update.add_peer(builder);
+    }
+
+    update
+        .apply(&name, wireguard_control::Backend::Kernel)
+        .map_err(|e| format!("applying WireGuard device config: {e}"))?;
+
+    crate::netlink::set_addr(&name, cfg.interface.address, 32)
+        .map_err(|e| format!("setting address: {e}"))?;
+    crate::netlink::set_up(&name, cfg.interface.mtu.unwrap_or(1420) as u32)
+        .map_err(|e| format!("bringing link up: {e}"))?;
+
+    for peer in &cfg.peers {
+        for net in &peer.allowed_ips {
+            crate::netlink::add_route(&name, *net)
+                .map_err(|e| format!("adding route {net}: {e}"))?;
+        }
+    }
+
+    Ok(())
+}
+
+/// The synchronous netlink/UAPI work behind [`RealSystemOps::teardown_interface`].
+/// Deletes the whole device; the kernel removes its addresses and routes
+/// as part of that, so there is nothing else to unwind separately.
+fn teardown_interface_blocking(iface: &str) -> Result<(), String> {
+    let name: wireguard_control::InterfaceName = iface
+        .parse()
+        .map_err(|e| format!("invalid interface name {iface:?}: {e}"))?;
+    match wireguard_control::Device::get(&name, wireguard_control::Backend::Kernel) {
+        Ok(device) => device
+            .delete()
+            .map_err(|e| format!("deleting interface: {e}")),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("looking up interface before delete: {e}")),
     }
 }
 
@@ -84,24 +221,6 @@ fn tmp_path_for(path: &Path) -> PathBuf {
     let mut s = path.as_os_str().to_owned();
     s.push(".wg-client-tmp");
     PathBuf::from(s)
-}
-
-async fn run_wg_quick(action: &str, conf_path: &Path) -> Result<(), String> {
-    let output = tokio::process::Command::new("wg-quick")
-        .arg(action)
-        .arg(conf_path)
-        .output()
-        .await
-        .map_err(|e| format!("failed to spawn wg-quick {action}: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "wg-quick {action} exited with {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
 }
 
 #[cfg(test)]
@@ -115,15 +234,12 @@ pub mod mock {
     pub struct MockSystemOps {
         files: Mutex<HashMap<PathBuf, Vec<u8>>>,
         up_interfaces: Mutex<HashSet<String>>,
-        /// Fail the next N `wg_quick_up`/`wg_quick_down` calls, then
-        /// succeed — so a test can fail exactly the candidate's apply
-        /// attempt and still let a subsequent rollback attempt succeed.
-        pub fail_next_wg_quick_up: Mutex<u32>,
-        pub fail_next_wg_quick_down: Mutex<u32>,
+        /// Fail the next N `apply_interface`/`teardown_interface` calls,
+        /// then succeed — so a test can fail exactly the candidate's
+        /// apply attempt and still let a subsequent rollback succeed.
+        pub fail_next_apply: Mutex<u32>,
+        pub fail_next_teardown: Mutex<u32>,
         pub calls: Mutex<Vec<String>>,
-        /// Interface name to report as up/down for `interface_exists`,
-        /// keyed by the conf_path's stem (tests use one interface).
-        pub iface_name: Mutex<String>,
     }
 
     impl MockSystemOps {
@@ -183,37 +299,38 @@ pub mod mock {
             self.up_interfaces.lock().unwrap().contains(iface)
         }
 
-        async fn wg_quick_up(&self, conf_path: &Path) -> Result<(), String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("up:{}", conf_path.display()));
+        async fn apply_interface(&self, iface: &str, conf_path: &Path) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("up:{iface}"));
             {
-                let mut n = self.fail_next_wg_quick_up.lock().unwrap();
+                let mut n = self.fail_next_apply.lock().unwrap();
                 if *n > 0 {
                     *n -= 1;
-                    return Err("injected wg-quick up failure".to_string());
+                    return Err("injected interface apply failure".to_string());
                 }
             }
-            let iface = self.iface_name.lock().unwrap().clone();
-            self.up_interfaces.lock().unwrap().insert(iface);
+            // A real apply would fail if conf_path doesn't parse; keep
+            // the mock honest about that precondition too.
+            if let Some(bytes) = self.files.lock().unwrap().get(conf_path) {
+                let text = String::from_utf8_lossy(bytes).to_string();
+                wg_common::render::parse_wg_quick(&text)
+                    .map_err(|e| format!("parse {conf_path:?}: {e}"))?;
+            } else {
+                return Err(format!("{conf_path:?} does not exist"));
+            }
+            self.up_interfaces.lock().unwrap().insert(iface.to_string());
             Ok(())
         }
 
-        async fn wg_quick_down(&self, conf_path: &Path) -> Result<(), String> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("down:{}", conf_path.display()));
+        async fn teardown_interface(&self, iface: &str) -> Result<(), String> {
+            self.calls.lock().unwrap().push(format!("down:{iface}"));
             {
-                let mut n = self.fail_next_wg_quick_down.lock().unwrap();
+                let mut n = self.fail_next_teardown.lock().unwrap();
                 if *n > 0 {
                     *n -= 1;
-                    return Err("injected wg-quick down failure".to_string());
+                    return Err("injected interface teardown failure".to_string());
                 }
             }
-            let iface = self.iface_name.lock().unwrap().clone();
-            self.up_interfaces.lock().unwrap().remove(&iface);
+            self.up_interfaces.lock().unwrap().remove(iface);
             Ok(())
         }
     }

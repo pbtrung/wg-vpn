@@ -47,10 +47,18 @@ fi
 echo "==> building x86_64 + aarch64 binaries for ${tag}"
 rm -rf "$dist_dir"
 mkdir -p "$dist_dir"
+# Resolve the tag to its commit and pass both: WG_VPN_REF is what the
+# Dockerfile clones, WG_VPN_COMMIT is what it verifies that clone landed
+# on. A bare tag name as the only build-arg would let Docker's cache
+# silently reuse a clone from before the tag last moved (see
+# Dockerfile.build's comment) -- this resolved commit changes whenever
+# that happens, so the cache is correctly busted either way.
+resolved_commit="$(git -C "$repo_root" rev-parse "$tag")"
 docker buildx build \
     -f "$package_dir/Dockerfile.build" \
     --output "type=local,dest=${dist_dir}" \
     --build-arg "WG_VPN_REF=${tag}" \
+    --build-arg "WG_VPN_COMMIT=${resolved_commit}" \
     "$package_dir"
 
 echo "==> packaging both binaries into one tarball per arch"

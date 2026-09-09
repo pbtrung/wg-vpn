@@ -20,6 +20,16 @@
 # Produces:
 #   package/dist/x86_64/{wg-server,wg-client}
 #   package/dist/aarch64/{wg-server,wg-client}
+#
+# Docker's build cache keys the clone step on WG_VPN_REF's literal
+# string, not on what that ref actually resolves to -- a mutable ref
+# (branch, or a tag later moved with `git tag -f`) can silently serve a
+# stale cached clone across builds even though it now points somewhere
+# else. WG_VPN_COMMIT, when set, both busts that cache correctly (its
+# value changes whenever the resolved commit does) and is verified
+# below, so a stale clone fails loudly instead of silently shipping old
+# code. package/release.sh always sets it by resolving WG_VPN_REF with
+# `git rev-parse` before invoking this build.
 
 FROM archlinux:base-devel AS builder
 RUN pacman -Syu --noconfirm \
@@ -29,8 +39,16 @@ RUN pacman -Syu --noconfirm \
 
 ARG WG_VPN_REPO=https://github.com/pbtrung/wg-vpn.git
 ARG WG_VPN_REF=main
+# Set by release.sh to the commit WG_VPN_REF resolved to at invocation
+# time; left empty for ad hoc manual builds, which skip verification.
+ARG WG_VPN_COMMIT=""
 WORKDIR /build
-RUN git clone --depth 1 --branch "$WG_VPN_REF" "$WG_VPN_REPO" .
+RUN git clone --depth 1 --branch "$WG_VPN_REF" "$WG_VPN_REPO" . \
+    && cloned="$(git rev-parse HEAD)" \
+    && if [ -n "$WG_VPN_COMMIT" ] && [ "$cloned" != "$WG_VPN_COMMIT" ]; then \
+         echo "expected to clone $WG_VPN_COMMIT (WG_VPN_REF=$WG_VPN_REF resolved to this by the caller) but got $cloned -- $WG_VPN_REF has since moved, or Docker's build cache is serving a stale clone from before it moved; rerun with --no-cache or delete/recreate the ref" >&2; \
+         exit 1; \
+       fi
 
 # x86_64: native build. Strip here rather than relying on PKGBUILD's
 # packaging step -- these binaries ship as-is (PKGBUILD sets

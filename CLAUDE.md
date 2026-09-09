@@ -150,25 +150,18 @@ it rather than committing by hand.
 - `r2_config.endpoint` HTTPS-only enforcement described in the docs isn't
   implemented in code (`docker-tests/` deliberately uses plain HTTP to
   talk to local MinIO).
-- **Pending migration: the docs (`docs/wg-client.md`, this file) describe
-  the target design — `wireguard-control`/netlink instead of shelling out
-  to `wg-quick`/`wg`, plus a boot-independent local interface check on
-  every pass — but `wg-client/src/system.rs`'s `RealSystemOps` and
-  `wg-client/src/sync.rs`'s `run_once` are not yet migrated to match.**
-  Concretely: (1) `RealSystemOps` still spawns the real `wg-quick`
-  binary; (2) `run_once` only restores the interface from local state
-  inside the `state.pending` branch — the general "interface absent, no
-  pending transaction" case (e.g. an ordinary reboot) still falls through
-  to `discover_and_download` first, so it depends on storage being
-  reachable, contrary to what §6 now documents. Because of (1),
-  `package/PKGBUILD`'s `depends=()`/`optdepends` and
-  `docker-tests/Dockerfile.client`'s comment (updated to the target,
-  no-`wg-quick`-required model) are **ahead of the actual binary** —
-  don't ship/release the package as-is until `RealSystemOps` is migrated,
-  or the installed binary will fail at runtime with `wireguard-tools`
-  treated as optional. Do the `wg-client` code migration (system.rs +
-  sync.rs) before or together with any release that carries these
-  packaging changes.
+- `wg-client/src/system.rs`'s `RealSystemOps` and `wg-client/src/sync.rs`
+  are migrated to the netlink/`wireguard-control` design described above
+  and in `docs/wg-client.md` (no `wg`/`wg-quick`/`ip` subprocess; the
+  interface-missing check runs unconditionally at the start of every pass,
+  not only inside `state.pending`). This has **not yet been exercised
+  against a real kernel interface** — only the mocked `SystemOps` unit
+  tests in `sync.rs` cover it so far. Run `docker-tests/` before trusting
+  this on a real fleet; per `docs/milestones.md` §4's "Real interface
+  application" test plan, it hasn't been confirmed there yet that
+  `DeviceUpdate::replace_peers()` actually drops a removed peer, that
+  routes get installed for every peer's `AllowedIPs`, or that teardown
+  (`Device::delete`) leaves a clean kernel state for the next apply.
 - M6's fuzzing is a dependency-free PRNG mutation stress test
   (`wg-common/tests/fuzz_like.rs`), not real `cargo-fuzz` — this
   environment has no `rustup`/nightly toolchain. Swap in real fuzz

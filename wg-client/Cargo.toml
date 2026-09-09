@@ -25,15 +25,21 @@ libc = "0.2"
 # netlink/UAPI, the way innernet does -- no wg/wg-quick subprocess. See
 # NOTICE.md: wireguard-control is LGPL-2.1-or-later, unlike the rest of
 # this workspace's MIT code.
-wireguard-control = "2.0.0"
+#
+# Git-pinned rather than crates.io: the published wireguard-control/
+# netlink-request 2.0.0 releases are frozen on an older netlink-packet-*
+# snapshot (route 0.21/core 0.7) that predates innernet's own "Update the
+# netlink ecosystem to latest versions" commit -- that upgrade hasn't
+# been re-published to crates.io as a new version. Pinning to that commit
+# gets the same netlink-packet-route/core innernet's own main branch
+# builds against today. Re-pin `rev` by hand if innernet cuts a real
+# crates.io release with this upgrade, or moves main further.
+wireguard-control = { git = "https://github.com/tonarino/innernet", rev = "1ba6154b6ebacd68dfe79c3a4f6273fd3e8dea35" }
 # Address/link/route management -- the part of "how innernet does it"
 # that wireguard-control itself doesn't cover. MIT-licensed, from the
-# same upstream project.
-# Pinned to match what netlink-request/wireguard-control 2.0.0 actually
-# depend on (checked via `cargo tree -i`) -- these are 0.x crates, so a
-# mismatched minor version here would silently produce a *different*,
-# type-incompatible RouteNetlinkMessage and fail to compile against
-# netlink_request::netlink_request_rtnl.
-netlink-request = "2.0.0"
-netlink-packet-core = "0.7"
-netlink-packet-route = "0.21"
+# same upstream project and the same pinned commit (must match
+# wireguard-control's rev so both resolve the same netlink-packet-route
+# types -- see the netlink-packet-* versions below).
+netlink-request = { git = "https://github.com/tonarino/innernet", rev = "1ba6154b6ebacd68dfe79c3a4f6273fd3e8dea35" }
+netlink-packet-core = "0.8"
+netlink-packet-route = "0.31"

@@ -7,6 +7,11 @@
 #   - every master reaches every other node and every other master
 #   - a spoke never reaches another spoke directly
 #
+# Also runs two chaos scenarios: SIGKILL-mid-sync recovery, and (M4's
+# planned "one route-conflict preflight rejection" PR-core case) a real
+# routing-table conflict that wg-client's live preflight must reject
+# before tearing down the working interface.
+#
 # Requires: docker with a running daemon, and a host that can create real
 # WireGuard interfaces inside a --cap-add=NET_ADMIN container (verified in
 # docs/milestones.md M4's "Supported execution mode").
@@ -126,6 +131,54 @@ if ping_ok master-us 10.10.0.100; then
     pass "tunnel still works after the killed transaction and recovery"
 else
     fail "tunnel broken after the killed transaction and recovery"
+fi
+
+# Planned M4 "PR core" scenario (docs/milestones.md §4): one
+# route-conflict preflight rejection. Replace the route for one of
+# mobile-01's peer AllowedIPs (master-us's tunnel address, 10.10.0.1/32)
+# with one via eth0 -- a real interface distinct from wg0 -- so the live
+# routing-table preflight (wg-client.md §6, wg-client/src/preflight.rs)
+# must reject the next apply before tearing down the working tunnel.
+# (`replace`, not `add`: wg0 already owns this destination from the
+# initial sync, and a plain `add` would just fail with "File exists".)
+log "chaos: injecting a conflicting route to trigger the route-conflict preflight"
+docker compose exec -T mobile-01 ip route replace 10.10.0.1/32 dev eth0
+wg0_ifindex_before=$(docker compose exec -T mobile-01 cat /sys/class/net/wg0/ifindex)
+
+reject_output=$(docker compose exec -T mobile-01 wg-client sync --config /etc/wg-client/config.json --once --hostname mobile-01 --force 2>&1) && reject_exit=0 || reject_exit=$?
+if [ "$reject_exit" != "0" ] && echo "$reject_output" | grep -q "route preflight failed"; then
+    pass "forced apply was rejected by the route-conflict preflight"
+else
+    echo "$reject_output"
+    fail "expected a route-conflict preflight rejection (exit=$reject_exit)"
+fi
+
+# A torn-down-and-recreated wg0 would get a new kernel ifindex; the
+# preflight must reject before touching the interface at all, so this
+# must be unchanged (wg-client.md §6: "Keep the current configuration on
+# any preflight error").
+wg0_ifindex_after=$(docker compose exec -T mobile-01 cat /sys/class/net/wg0/ifindex)
+if [ "$wg0_ifindex_after" = "$wg0_ifindex_before" ]; then
+    pass "wg0 was never torn down by the rejected apply (preflight kept the existing configuration untouched)"
+else
+    fail "wg0 was recreated despite the preflight rejection (ifindex changed: $wg0_ifindex_before -> $wg0_ifindex_after)"
+fi
+
+log "chaos: removing the injected conflicting route"
+docker compose exec -T mobile-01 ip route del 10.10.0.1/32 dev eth0
+
+if docker compose exec -T mobile-01 wg-client sync --config /etc/wg-client/config.json --once --hostname mobile-01 --force; then
+    pass "apply succeeds once the conflicting route is removed"
+else
+    fail "apply still failing after removing the conflicting route"
+fi
+
+docker compose exec -T mobile-01 ping -c 3 -W 2 10.10.0.1 >/dev/null 2>&1 || true
+sleep 1
+if ping_ok mobile-01 10.10.0.1; then
+    pass "tunnel to master-us reachable again once the conflicting route is removed and reapplied"
+else
+    fail "tunnel to master-us still unreachable after removing the conflicting route and reapplying"
 fi
 
 if [ "$FAILED" = "0" ]; then

@@ -33,12 +33,26 @@ pub enum ConfigError {
     InvalidJson(String),
     #[error("invalid conf_path {0:?}: {1}")]
     InvalidConfPath(String, &'static str),
+    #[error("invalid r2_config.endpoint {0:?}: {1}")]
+    InvalidR2Endpoint(String, &'static str),
+    #[error("invalid r2_config credentials: {0}")]
+    InvalidR2Credentials(&'static str),
 }
 
 pub fn parse(text: &str) -> Result<ClientConfig, ConfigError> {
     strict_json::check_no_duplicate_keys(text)
         .map_err(|e| ConfigError::DuplicateJsonKey(e.to_string()))?;
-    serde_json::from_str(text).map_err(|e| ConfigError::InvalidJson(e.to_string()))
+    let cfg: ClientConfig =
+        serde_json::from_str(text).map_err(|e| ConfigError::InvalidJson(e.to_string()))?;
+    wg_common::topology::validate_r2_endpoint(&cfg.r2_config.endpoint)
+        .map_err(|e| ConfigError::InvalidR2Endpoint(cfg.r2_config.endpoint.clone(), e))?;
+    wg_common::topology::validate_r2_credentials(
+        &cfg.r2_config.read_only_access_key_id,
+        &cfg.r2_config.read_only_secret_access_key,
+        cfg.r2_config.session_token.as_deref(),
+    )
+    .map_err(ConfigError::InvalidR2Credentials)?;
+    Ok(cfg)
 }
 
 /// The WireGuard interface name is the filename stem of `conf_path`
@@ -140,5 +154,43 @@ mod tests {
         let text = r#"{"r2_config":{"endpoint":"https://x","read_only_access_key_id":"a","read_only_secret_access_key":"b","region":"auto","bucket":"c"},"conf_path":"/etc/wireguard/wg0.conf"}"#;
         let cfg = parse(text).unwrap();
         assert_eq!(cfg.conf_path, "/etc/wireguard/wg0.conf");
+    }
+
+    #[test]
+    fn parse_accepts_plain_http_endpoint() {
+        // Deliberately allowed: docker-tests talks to local MinIO over
+        // plain HTTP (see CLAUDE.md "Known simplifications").
+        let text = r#"{"r2_config":{"endpoint":"http://minio:9000","read_only_access_key_id":"a","read_only_secret_access_key":"b","region":"auto","bucket":"c"},"conf_path":"/etc/wireguard/wg0.conf"}"#;
+        assert!(parse(text).is_ok());
+    }
+
+    #[test]
+    fn parse_rejects_non_http_scheme() {
+        let text = r#"{"r2_config":{"endpoint":"ftp://x","read_only_access_key_id":"a","read_only_secret_access_key":"b","region":"auto","bucket":"c"},"conf_path":"/etc/wireguard/wg0.conf"}"#;
+        assert!(parse(text).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_endpoint_with_userinfo() {
+        let text = r#"{"r2_config":{"endpoint":"https://user:pass@x","read_only_access_key_id":"a","read_only_secret_access_key":"b","region":"auto","bucket":"c"},"conf_path":"/etc/wireguard/wg0.conf"}"#;
+        assert!(parse(text).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_endpoint_with_query_string() {
+        let text = r#"{"r2_config":{"endpoint":"https://x?token=abc","read_only_access_key_id":"a","read_only_secret_access_key":"b","region":"auto","bucket":"c"},"conf_path":"/etc/wireguard/wg0.conf"}"#;
+        assert!(parse(text).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_access_key() {
+        let text = r#"{"r2_config":{"endpoint":"https://x","read_only_access_key_id":"","read_only_secret_access_key":"b","region":"auto","bucket":"c"},"conf_path":"/etc/wireguard/wg0.conf"}"#;
+        assert!(parse(text).is_err());
+    }
+
+    #[test]
+    fn parse_rejects_empty_session_token_when_present() {
+        let text = r#"{"r2_config":{"endpoint":"https://x","read_only_access_key_id":"a","read_only_secret_access_key":"b","session_token":"","region":"auto","bucket":"c"},"conf_path":"/etc/wireguard/wg0.conf"}"#;
+        assert!(parse(text).is_err());
     }
 }

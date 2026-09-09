@@ -8,6 +8,14 @@ rules for real — including the one property that's easy to get backwards
 and impossible to catch with mocks: a spoke never reaches another spoke
 directly.
 
+It also runs two chaos scenarios against real containers: killing
+`wg-client` mid-sync and verifying backup recovery on the next pass, and
+(`docs/milestones.md` §4's planned "one route-conflict preflight
+rejection" PR-core case) injecting a real routing-table conflict and
+verifying `wg-client`'s live preflight (`wg-client/src/preflight.rs`,
+`docs/wg-client.md` §6) rejects the apply *before* tearing down the
+working interface, leaving it running untouched.
+
 ## Requirements
 
 - Docker with a running daemon.
@@ -38,5 +46,7 @@ remember to `docker compose down -v` afterward.
   a provider-IAM concern, tracked separately in `docs/milestones.md` §5.
 - The gateway/NAT/idle-keepalive fixtures from `docs/milestones.md` §4 —
   this is the minimal two-master/two-spoke fixture only.
-- Chaos scenarios (M5) — process kills and storage partitions aren't
-  exercised here.
+- Most of M5's chaos matrix: graceful stop/`SIGTERM` handling, storage
+  partitions, killing `wg-server` mid-upload, and real transport races
+  aren't exercised here — only the `wg-client` `SIGKILL`-mid-sync
+  recovery and route-conflict preflight rejection scenarios are.

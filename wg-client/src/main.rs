@@ -1,5 +1,6 @@
 mod config;
 mod netlink;
+mod preflight;
 mod storage;
 mod sync;
 mod system;
@@ -133,10 +134,27 @@ async fn run_sync_pass(
         }
     })?;
 
+    let storage_endpoint_host = wg_common::topology::r2_endpoint_host(&cfg.r2_config.endpoint)
+        .ok_or_else(|| {
+            format!(
+                "could not determine host from r2_config.endpoint {:?}",
+                cfg.r2_config.endpoint
+            )
+        })?;
+
     let storage = storage::R2ReadClient::new(&cfg.r2_config);
     let ops = system::RealSystemOps;
     let conf_path = config::conf_path_buf(&cfg.conf_path);
-    Ok(sync::run_once(&storage, &ops, &hostname, &iface, &conf_path, force).await)
+    Ok(sync::run_once(
+        &storage,
+        &ops,
+        &hostname,
+        &iface,
+        &conf_path,
+        force,
+        &storage_endpoint_host,
+    )
+    .await)
 }
 
 fn report(outcome: &sync::SyncOutcome) {

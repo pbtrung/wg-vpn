@@ -151,13 +151,32 @@ it rather than committing by hand.
   and "read-only" access — real per-node credential scoping is a
   provider-IAM concern (`docs/wg-server.md` §12) and isn't exercised by
   this harness.
-- `wg-client`'s live route-conflict preflight (checking a new config's
-  routes against the host's actual routing table before teardown) is not
-  implemented — only the structural/semantic validation in
-  `wg-common`'s parser runs before applying.
-- `r2_config.endpoint` HTTPS-only enforcement described in the docs isn't
-  implemented in code (`docker-tests/` deliberately uses plain HTTP to
-  talk to local MinIO).
+- `wg-client`'s live route-conflict preflight is implemented
+  (`wg-client/src/preflight.rs`, wired into `sync::run_once` via
+  `SystemOps::preflight`, called before any backup/pending-state/teardown
+  mutation once a pass has decided to apply): it dumps the host's IPv4
+  routing table over netlink (`wg-client/src/netlink.rs::list_ipv4_routes`)
+  and rejects a candidate whose peer routes overlap another interface's
+  existing non-default route, or would capture the storage endpoint,
+  this tunnel's configured DNS, or a peer's transport endpoint (all
+  resolved via DNS with the bounded 20s budget docs/wg-client.md §6
+  specifies). Confirmed against real kernel interfaces by
+  `docker-tests/`, which exercises this path on every sync and also runs
+  a dedicated rejection scenario (docs/milestones.md §4's planned "one
+  route-conflict preflight rejection" PR-core case): injects a real
+  conflicting route and verifies `wg-client` rejects the apply without
+  ever tearing down the working interface. Still not implemented:
+  DNS/`resolvconf` integration itself (see below) — the preflight only
+  protects the *configured* DNS resolver address, it doesn't apply one.
+- `r2_config.endpoint`/credentials get real validation now
+  (`wg_common::topology::validate_r2_endpoint`/`validate_r2_credentials`,
+  called from both `wg-server`'s `topology::validate()` and `wg-client`'s
+  `config::parse()`): non-`http`/`https` scheme, URL userinfo, query
+  strings, fragments, and empty credential fields are all rejected. Full
+  HTTPS-only enforcement (rejecting plain `http://` specifically) is
+  still deliberately not implemented, since `docker-tests/` talks to
+  local MinIO over plain HTTP — closing that needs a TLS-enabled test
+  harness, not just a stricter check.
 - `wg-client/src/system.rs`'s `RealSystemOps` and `wg-client/src/sync.rs`
   are migrated to the netlink/`wireguard-control` design described above
   and in `docs/wg-client.md` (no `wg`/`wg-quick`/`ip` subprocess; the
@@ -168,8 +187,9 @@ it rather than committing by hand.
   and the local-first restore firing correctly during the SIGKILL/recovery
   chaos scenario. Not yet covered by that harness: running as a truly
   unprivileged `CAP_NET_ADMIN`-only user (containers there still run as
-  root), and DNS/`resolvconf` integration and route-conflict preflight
-  remain unimplemented regardless (see the two bullets above/below).
+  root), and DNS/`resolvconf` integration remains unimplemented
+  regardless (see the bullets above/below) — route-conflict preflight is
+  covered separately above.
   `wireguard-control`/`netlink-request` are git-pinned to a specific
   innernet commit rather than a crates.io release — see the comment in
   `wg-client/Cargo.toml` for why, and re-pin by hand if innernet cuts a

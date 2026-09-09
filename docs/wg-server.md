@@ -164,7 +164,7 @@ same one-generation retention policy.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `endpoint` | string (URL) | yes | HTTPS S3-compatible endpoint. The provider must support the consistency and conditional-write requirements in §10. Reject plaintext HTTP, URL userinfo, query strings, and fragments. |
+| `endpoint` | string (URL) | yes | HTTPS S3-compatible endpoint. The provider must support the consistency and conditional-write requirements in §10. Reject a non-`http`/`https` scheme, URL userinfo, query strings, and fragments. HTTPS-only rejection of plain `http://` is not yet enforced — see §12. |
 | `read_write_access_key_id` | string | yes | Must have `PutObject`/`GetObject`/`ListBucket`/`DeleteObject` on `bucket`. |
 | `read_write_secret_access_key` | string | yes | Secret half of the above. |
 | `session_token` | string | no | Required when the supplied access-key pair represents temporary credentials. Load fresh credentials for every cron invocation. |
@@ -783,9 +783,16 @@ is a new publication decision and still propagates on client schedules.
   but no private keys or PSKs. Access to it is part of the client trust
   model; deployments requiring private fleet membership need a different
   discovery mechanism.
-- Both binaries enforce `https://` and normal certificate validation in
-  their own configuration validation. The SDK permits HTTP endpoints; it
-  must not be relied on to reject them
+- Both binaries validate `r2_config.endpoint` in their own configuration
+  validation (`wg_common::topology::validate_r2_endpoint`): reject a
+  non-`http`/`https` scheme, URL userinfo, query strings, and fragments,
+  and reject empty credential fields
+  (`wg_common::topology::validate_r2_credentials`). Rejecting plain
+  `http://` specifically is deliberately not yet enforced —
+  `docker-tests/` talks to local MinIO over plain HTTP by design (see
+  CLAUDE.md "Known simplifications"), and closing this gap needs a
+  TLS-enabled test harness first. Until then, the SDK's own permissiveness
+  for HTTP endpoints must not be relied on as a substitute
   ([SDK endpoint documentation](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/endpoints.html)).
 - Both retained generations contain private keys; deletion or removal from
   the current topology does not revoke previously downloaded keys or

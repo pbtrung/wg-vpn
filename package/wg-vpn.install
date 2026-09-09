@@ -5,6 +5,10 @@ post_install() {
         --comment "wg-vpn server (apply)" wg-server
     chown root:wg-server /etc/wg-server
     chmod 750 /etc/wg-server
+    # Re-apply on upgrade too: makepkg's install -dm750 only sets the
+    # mode on first install, and an upgrade from a package version that
+    # created this world-readable (0755) would otherwise keep that mode.
+    chmod 750 /etc/wg-client
 
     cat <<'EOF'
 ==> wg-vpn installed. Next steps:

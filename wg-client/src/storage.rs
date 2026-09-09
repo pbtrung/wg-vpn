@@ -6,6 +6,7 @@ use aws_sdk_s3::Client;
 use aws_sdk_s3::config::retry::RetryConfig;
 use aws_sdk_s3::config::{BehaviorVersion, Credentials, Region};
 use thiserror::Error;
+use wg_common::limits::MAX_DISCOVERY_JSON_BYTES;
 
 use crate::config::R2ReadConfig;
 
@@ -65,6 +66,27 @@ impl ReadStorage for R2ReadClient {
             .await;
         match result {
             Ok(resp) => {
+                // Reject an oversized/unreported object before buffering
+                // it into memory -- a malformed or compromised bucket
+                // must not be able to exhaust client memory just by
+                // returning a huge response.
+                match resp.content_length() {
+                    Some(len) if len >= 0 && len as u64 <= MAX_DISCOVERY_JSON_BYTES as u64 => {}
+                    Some(len) => {
+                        return Err(StorageError::Get(
+                            key.to_string(),
+                            format!(
+                                "object is {len} bytes, exceeding the {MAX_DISCOVERY_JSON_BYTES} byte limit"
+                            ),
+                        ));
+                    }
+                    None => {
+                        return Err(StorageError::Get(
+                            key.to_string(),
+                            "response had no Content-Length".to_string(),
+                        ));
+                    }
+                }
                 let bytes = resp
                     .body
                     .collect()

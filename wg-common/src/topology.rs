@@ -118,6 +118,66 @@ pub enum ValidationError {
     },
     #[error("edge between {0:?} and {1:?} has no endpoint configured on either side")]
     EdgeMissingEndpoint(String, String),
+    #[error("invalid r2_config.endpoint {0:?}: {1}")]
+    InvalidR2Endpoint(String, &'static str),
+    #[error("invalid r2_config credentials: {0}")]
+    InvalidR2Credentials(&'static str),
+}
+
+/// Validate an `r2_config.endpoint` URL, shared by `wg-server`'s
+/// `R2Config` and `wg-client`'s `R2ReadConfig` (wg-server.md §9,
+/// wg-client.md §4/§10: reject URL userinfo, query strings, and
+/// fragments). HTTPS-only enforcement is deliberately not included here:
+/// `docker-tests/` talks to local MinIO over plain HTTP by design (see
+/// this repo's CLAUDE.md "Known simplifications" and wg-server.md's
+/// "the SDK permits HTTP endpoints" caveat) — closing that gap needs a
+/// TLS-enabled test harness, not just a stricter check here.
+pub fn validate_r2_endpoint(s: &str) -> Result<(), &'static str> {
+    let url = url::Url::parse(s).map_err(|_| "not a valid URL")?;
+    if url.scheme() != "http" && url.scheme() != "https" {
+        return Err("scheme must be http or https");
+    }
+    if url.host_str().is_none() {
+        return Err("URL must have a host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("URL must not contain userinfo");
+    }
+    if url.query().is_some() {
+        return Err("URL must not contain a query string");
+    }
+    if url.fragment().is_some() {
+        return Err("URL must not contain a fragment");
+    }
+    Ok(())
+}
+
+/// Extract the host from an `r2_config.endpoint` URL already accepted by
+/// [`validate_r2_endpoint`], for `wg-client`'s route-conflict preflight
+/// (wg-client.md §6): the storage endpoint's resolved address must not be
+/// captured by a candidate peer route.
+pub fn r2_endpoint_host(s: &str) -> Option<String> {
+    url::Url::parse(s).ok()?.host_str().map(str::to_string)
+}
+
+/// Reject blank R2 credential fields, shared by `wg-server`'s `R2Config`
+/// and `wg-client`'s `R2ReadConfig`. A present-but-empty `session_token`
+/// is rejected too (wg-client.md §4: "when present it must be nonempty").
+pub fn validate_r2_credentials(
+    access_key_id: &str,
+    secret_access_key: &str,
+    session_token: Option<&str>,
+) -> Result<(), &'static str> {
+    if access_key_id.is_empty() {
+        return Err("access key id must not be empty");
+    }
+    if secret_access_key.is_empty() {
+        return Err("secret access key must not be empty");
+    }
+    if session_token == Some("") {
+        return Err("session token, if present, must not be empty");
+    }
+    Ok(())
 }
 
 /// Parse (with strict duplicate-key rejection) and deserialize a topology
@@ -248,6 +308,15 @@ pub fn validate(
     config: &TopologyConfig,
 ) -> Result<(ValidatedTopology, Vec<String>), ValidationError> {
     let mut warnings = Vec::new();
+
+    validate_r2_endpoint(&config.r2_config.endpoint)
+        .map_err(|e| ValidationError::InvalidR2Endpoint(config.r2_config.endpoint.clone(), e))?;
+    validate_r2_credentials(
+        &config.r2_config.read_write_access_key_id,
+        &config.r2_config.read_write_secret_access_key,
+        config.r2_config.session_token.as_deref(),
+    )
+    .map_err(ValidationError::InvalidR2Credentials)?;
 
     if config.nodes.is_empty() {
         return Err(ValidationError::EmptyNodes());
@@ -460,6 +529,84 @@ mod tests {
             ],
             master: vec!["master-us".into(), "master-eu".into()],
         }
+    }
+
+    #[test]
+    fn r2_endpoint_accepts_https() {
+        assert!(validate_r2_endpoint("https://accountid.r2.cloudflarestorage.com").is_ok());
+    }
+
+    #[test]
+    fn r2_endpoint_accepts_plain_http() {
+        // Deliberately allowed: docker-tests talks to local MinIO over
+        // plain HTTP by design (CLAUDE.md "Known simplifications").
+        assert!(validate_r2_endpoint("http://minio:9000").is_ok());
+    }
+
+    #[test]
+    fn r2_endpoint_rejects_non_http_scheme() {
+        assert!(validate_r2_endpoint("ftp://example.com").is_err());
+    }
+
+    #[test]
+    fn r2_endpoint_rejects_userinfo() {
+        assert!(validate_r2_endpoint("https://user:pass@example.com").is_err());
+    }
+
+    #[test]
+    fn r2_endpoint_rejects_query_string() {
+        assert!(validate_r2_endpoint("https://example.com?token=abc").is_err());
+    }
+
+    #[test]
+    fn r2_endpoint_rejects_fragment() {
+        assert!(validate_r2_endpoint("https://example.com#frag").is_err());
+    }
+
+    #[test]
+    fn r2_endpoint_rejects_unparseable_url() {
+        assert!(validate_r2_endpoint("not a url").is_err());
+    }
+
+    #[test]
+    fn r2_credentials_rejects_empty_access_key() {
+        assert!(validate_r2_credentials("", "secret", None).is_err());
+    }
+
+    #[test]
+    fn r2_credentials_rejects_empty_secret() {
+        assert!(validate_r2_credentials("id", "", None).is_err());
+    }
+
+    #[test]
+    fn r2_credentials_rejects_empty_session_token_when_present() {
+        assert!(validate_r2_credentials("id", "secret", Some("")).is_err());
+    }
+
+    #[test]
+    fn r2_credentials_accepts_valid_fields() {
+        assert!(validate_r2_credentials("id", "secret", Some("token")).is_ok());
+        assert!(validate_r2_credentials("id", "secret", None).is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_bad_r2_endpoint_in_full_config() {
+        let mut config = example_config();
+        config.r2_config.endpoint = "http://user:pass@minio:9000".into();
+        assert!(matches!(
+            validate(&config),
+            Err(ValidationError::InvalidR2Endpoint(_, _))
+        ));
+    }
+
+    #[test]
+    fn validate_rejects_empty_r2_credentials_in_full_config() {
+        let mut config = example_config();
+        config.r2_config.read_write_access_key_id = String::new();
+        assert!(matches!(
+            validate(&config),
+            Err(ValidationError::InvalidR2Credentials(_))
+        ));
     }
 
     #[test]

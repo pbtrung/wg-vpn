@@ -37,6 +37,18 @@ pub trait SystemOps {
     /// Remove the interface entirely (kernel cleans up its addresses
     /// and routes as part of deleting the link).
     async fn teardown_interface(&self, iface: &str) -> Result<(), String>;
+
+    /// Route-conflict preflight (wg-client.md §6): before tearing down
+    /// the working interface for `cfg`, reject it if any candidate peer
+    /// route would overlap another interface's existing route or capture
+    /// the storage endpoint, this tunnel's configured DNS, or a peer's
+    /// transport endpoint.
+    async fn preflight(
+        &self,
+        cfg: &wg_common::render::ParsedConfig,
+        storage_endpoint_host: &str,
+        managed_iface: &str,
+    ) -> Result<(), String>;
 }
 
 pub struct RealSystemOps;
@@ -122,6 +134,15 @@ impl SystemOps for RealSystemOps {
         tokio::task::spawn_blocking(move || teardown_interface_blocking(&iface))
             .await
             .map_err(|e| format!("interface teardown task panicked: {e}"))?
+    }
+
+    async fn preflight(
+        &self,
+        cfg: &wg_common::render::ParsedConfig,
+        storage_endpoint_host: &str,
+        managed_iface: &str,
+    ) -> Result<(), String> {
+        crate::preflight::check(cfg, storage_endpoint_host, managed_iface).await
     }
 }
 
@@ -239,6 +260,10 @@ pub mod mock {
         /// apply attempt and still let a subsequent rollback succeed.
         pub fail_next_apply: Mutex<u32>,
         pub fail_next_teardown: Mutex<u32>,
+        /// Fail the next N `write_file_atomic` calls, then succeed.
+        pub fail_next_write: Mutex<u32>,
+        /// Fail the next N `preflight` calls, then succeed.
+        pub fail_next_preflight: Mutex<u32>,
         pub calls: Mutex<Vec<String>>,
     }
 
@@ -269,6 +294,13 @@ pub mod mock {
         }
 
         fn write_file_atomic(&self, path: &Path, contents: &[u8]) -> Result<(), String> {
+            {
+                let mut n = self.fail_next_write.lock().unwrap();
+                if *n > 0 {
+                    *n -= 1;
+                    return Err("injected write failure".to_string());
+                }
+            }
             self.files
                 .lock()
                 .unwrap()
@@ -331,6 +363,21 @@ pub mod mock {
                 }
             }
             self.up_interfaces.lock().unwrap().remove(iface);
+            Ok(())
+        }
+
+        async fn preflight(
+            &self,
+            _cfg: &wg_common::render::ParsedConfig,
+            _storage_endpoint_host: &str,
+            _managed_iface: &str,
+        ) -> Result<(), String> {
+            self.calls.lock().unwrap().push("preflight".to_string());
+            let mut n = self.fail_next_preflight.lock().unwrap();
+            if *n > 0 {
+                *n -= 1;
+                return Err("injected preflight failure".to_string());
+            }
             Ok(())
         }
     }

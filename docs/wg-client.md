@@ -109,7 +109,7 @@ process could have pre-created.
 
 | Field | Type | Required | Notes |
 |---|---|---|---|
-| `r2_config.endpoint` | string (URL) | yes | Same authenticated HTTPS endpoint the server publishes to. Reject HTTP, URL userinfo, query strings, and fragments; require normal certificate validation. |
+| `r2_config.endpoint` | string (URL) | yes | Same authenticated endpoint the server publishes to. Reject a non-`http`/`https` scheme, URL userinfo, query strings, and fragments. HTTPS-only rejection of plain `http://` is not yet enforced — see §10. |
 | `r2_config.read_only_access_key_id` / `read_only_secret_access_key` | string | yes | Distinct per-node credentials permitting `GetObject` for `current.json` and `nodes/{hostname}/` only (see wg-server.md §12). No listing or writing is needed. Must **not** be the server or credential issuer's pair. |
 | `r2_config.session_token` | string | conditional | Required for temporary credentials such as scoped R2 tokens. Omit for a long-lived pair; when present it must be nonempty. All blank credentials in this example are deployment placeholders. |
 | `r2_config.region` | string | yes | `"auto"` for R2. |
@@ -670,7 +670,13 @@ host's resolver setup.
   bytes relative to the pointer, not against a compromised bucket writer.
   The directive allowlist prevents downloaded hooks from becoming root
   shell commands; a writer can still change trusted VPN identities/routes.
-- Enforce HTTPS and certificate verification in application code. Keep
+- Validate `r2_config.endpoint` in application code
+  (`wg_common::topology::validate_r2_endpoint`): reject a non-`http`/
+  `https` scheme, URL userinfo, query strings, and fragments; reject
+  empty credential fields (`validate_r2_credentials`). Rejecting plain
+  `http://` specifically, and full certificate-verification enforcement,
+  are not yet implemented — `docker-tests/` deliberately uses plain HTTP
+  against local MinIO (CLAUDE.md "Known simplifications"). Keep
   discovery/config downloads on the configured authenticated endpoint.
 - Redact private keys, PSKs, credentials, request signing headers, complete
   configs, and secret kernel fields from logs, parser diagnostics, and any

@@ -61,7 +61,11 @@ package() {
     # Config lives here, not shipped by the package -- see wg-vpn.install
     # and README.md "Configure" for the schemas.
     install -dm750 "${pkgdir}/etc/wg-server"
-    install -dm755 "${pkgdir}/etc/wg-client"
+    # wg-client runs as root by default (wg-client.service), so this
+    # needs no dedicated group the way /etc/wg-server does -- just kept
+    # unreadable by other local users, since config.json holds this
+    # node's per-node R2 read-only credentials and session token.
+    install -dm750 "${pkgdir}/etc/wg-client"
 
     install -Dm644 "${srcdir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
 }

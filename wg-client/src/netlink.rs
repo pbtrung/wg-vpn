@@ -10,7 +10,9 @@ use std::io;
 use std::net::Ipv4Addr;
 
 use ipnet::Ipv4Net;
-use netlink_packet_core::{NLM_F_ACK, NLM_F_CREATE, NLM_F_REPLACE, NLM_F_REQUEST};
+use netlink_packet_core::{
+    NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_REPLACE, NLM_F_REQUEST, NetlinkPayload,
+};
 use netlink_packet_route::{
     AddressFamily, RouteNetlinkMessage,
     address::{self, AddressHeader, AddressMessage},
@@ -28,6 +30,68 @@ fn if_index(name: &InterfaceName) -> Result<u32, io::Error> {
         )),
         index => Ok(index),
     }
+}
+
+/// The interface index for `name`, if it currently exists. Used by the
+/// route-conflict preflight to recognize the managed interface's own
+/// (about-to-be-replaced) routes among the dumped routing table.
+pub fn interface_index(name: &str) -> Option<u32> {
+    let name: InterfaceName = name.parse().ok()?;
+    if_index(&name).ok()
+}
+
+/// The interface name for a route's outbound interface index, best-effort
+/// (only used to make a preflight rejection message readable).
+pub fn if_name_from_index(index: u32) -> Option<String> {
+    let mut buf = [0i8; libc::IF_NAMESIZE];
+    let ptr = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
+    if ptr.is_null() {
+        return None;
+    }
+    let cstr = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+    cstr.to_str().ok().map(str::to_string)
+}
+
+/// List every IPv4 unicast route currently installed in the main routing
+/// table, as (destination, outbound interface index) pairs -- used by the
+/// route-conflict preflight (wg-client.md §6: "check candidate routes
+/// against the local routing table").
+pub fn list_ipv4_routes() -> Result<Vec<(Ipv4Net, u32)>, io::Error> {
+    let responses = netlink_request_rtnl(
+        RouteNetlinkMessage::GetRoute(RouteMessage::default()),
+        Some(NLM_F_REQUEST | NLM_F_DUMP),
+    )?;
+    let mut routes = Vec::new();
+    for response in responses {
+        let NetlinkPayload::InnerMessage(RouteNetlinkMessage::NewRoute(msg)) = response.payload
+        else {
+            continue;
+        };
+        if msg.header.address_family != AddressFamily::Inet
+            || msg.header.table != RouteHeader::RT_TABLE_MAIN
+            || msg.header.kind != route::RouteType::Unicast
+        {
+            continue;
+        }
+        let mut dest = Ipv4Addr::UNSPECIFIED;
+        let mut oif = None;
+        for attr in &msg.attributes {
+            match attr {
+                route::RouteAttribute::Destination(route::RouteAddress::Inet(addr)) => {
+                    dest = *addr;
+                }
+                route::RouteAttribute::Oif(index) => oif = Some(*index),
+                _ => {}
+            }
+        }
+        if let (Some(oif), Ok(net)) = (
+            oif,
+            Ipv4Net::new(dest, msg.header.destination_prefix_length),
+        ) {
+            routes.push((net, oif));
+        }
+    }
+    Ok(routes)
 }
 
 /// Set the interface administratively up with the given MTU.

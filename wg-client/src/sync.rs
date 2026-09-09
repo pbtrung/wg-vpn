@@ -47,10 +47,9 @@ fn load_state<O: SystemOps>(ops: &O, path: &Path) -> LocalState {
         .unwrap_or_default()
 }
 
-fn save_state<O: SystemOps>(ops: &O, path: &Path, state: &LocalState) {
-    if let Ok(bytes) = serde_json::to_vec(state) {
-        let _ = ops.write_file_atomic(path, &bytes);
-    }
+fn save_state<O: SystemOps>(ops: &O, path: &Path, state: &LocalState) -> Result<(), String> {
+    let bytes = serde_json::to_vec(state).map_err(|e| format!("serializing state: {e}"))?;
+    ops.write_file_atomic(path, &bytes)
 }
 
 fn digest_of(bytes: &[u8]) -> String {
@@ -138,13 +137,18 @@ async fn attempt_rollback<O: SystemOps>(
     outcome.rollback_attempted = true;
     if !had_backup {
         tracing::info!("no backup to roll back to (first install failure)");
-        save_state(ops, paths.state_path, state); // nothing to roll back to; pending stays set
+        // nothing to roll back to; pending stays set
+        if let Err(e) = save_state(ops, paths.state_path, state) {
+            tracing::error!(error = %e, "failed to persist state after rollback (no backup)");
+        }
         return;
     }
     tracing::info!("restoring backup config");
     if ops.copy_file(paths.backup_path, paths.conf_path).is_err() {
         tracing::warn!("failed to restore backup file during rollback");
-        save_state(ops, paths.state_path, state);
+        if let Err(e) = save_state(ops, paths.state_path, state) {
+            tracing::error!(error = %e, "failed to persist state after failed backup restore");
+        }
         return;
     }
     let ok = ops.apply_interface(iface, paths.conf_path).await.is_ok();
@@ -156,7 +160,9 @@ async fn attempt_rollback<O: SystemOps>(
     if ok {
         state.pending = false;
     }
-    save_state(ops, paths.state_path, state);
+    if let Err(e) = save_state(ops, paths.state_path, state) {
+        tracing::error!(error = %e, "failed to persist state after rollback");
+    }
 }
 
 /// Innernet-style local-first reconciliation: independent of whether a
@@ -208,6 +214,7 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
     iface: &str,
     conf_path: &Path,
     force: bool,
+    storage_endpoint_host: &str,
 ) -> SyncOutcome {
     tracing::info!(hostname, iface, force, "starting sync pass");
     let state_path = state_path_for(conf_path);
@@ -225,7 +232,9 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
             let _ = ops.copy_file(&backup_path, conf_path);
         }
         state.pending = false;
-        save_state(ops, &state_path, &state);
+        if let Err(e) = save_state(ops, &state_path, &state) {
+            tracing::error!(error = %e, "failed to persist state after recovering pending transaction");
+        }
     }
 
     // Local-first reconciliation, independent of whether a transaction
@@ -244,10 +253,13 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
     };
 
     let text = String::from_utf8_lossy(&bytes).to_string();
-    if let Err(e) = wg_common::render::parse_wg_quick(&text) {
-        outcome.error = Some(format!("downloaded config failed validation: {e}"));
-        return outcome;
-    }
+    let parsed_cfg = match wg_common::render::parse_wg_quick(&text) {
+        Ok(c) => c,
+        Err(e) => {
+            outcome.error = Some(format!("downloaded config failed validation: {e}"));
+            return outcome;
+        }
+    };
 
     let unchanged = !force
         && state.applied_digest.as_deref() == Some(digest.as_str())
@@ -255,6 +267,18 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
     if unchanged {
         tracing::debug!(generation = %generation_id, "content unchanged and interface up, no-op");
         outcome.no_op = true;
+        return outcome;
+    }
+
+    // Before touching anything: reject a candidate whose routes would
+    // conflict with the host's routing table or capture the storage
+    // endpoint/DNS/a peer's transport endpoint (wg-client.md §6). Keep
+    // the current configuration untouched on any preflight error.
+    if let Err(e) = ops
+        .preflight(&parsed_cfg, storage_endpoint_host, iface)
+        .await
+    {
+        outcome.error = Some(format!("route preflight failed: {e}"));
         return outcome;
     }
 
@@ -266,7 +290,16 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
     }
     state.pending = true;
     state.had_backup_before_pending = had_backup;
-    save_state(ops, &state_path, &state);
+    if let Err(e) = save_state(ops, &state_path, &state) {
+        // The pending marker must be durably persisted before teardown
+        // (wg-client.md §6's "Local transaction ordering is durable");
+        // without it a crash mid-install could restore this candidate as
+        // "last good" on restart. Leave the existing interface untouched.
+        outcome.error = Some(format!(
+            "failed to persist pending-transaction state before teardown: {e}"
+        ));
+        return outcome;
+    }
 
     if ops.interface_exists(iface) {
         tracing::debug!(iface, "tearing down interface before install");
@@ -298,7 +331,17 @@ pub async fn run_once<S: ReadStorage, O: SystemOps>(
     state.applied_generation_id = Some(generation_id);
     state.applied_digest = Some(digest);
     state.hostname = hostname.to_string();
-    save_state(ops, &state_path, &state);
+    if let Err(e) = save_state(ops, &state_path, &state) {
+        // The interface is already up and correct; a stale on-disk
+        // `pending: true` just costs the next pass an unnecessary (but
+        // safe) rollback-and-reapply cycle, so this is reported but not
+        // treated as a failed sync.
+        tracing::error!(
+            error = %e,
+            "failed to persist applied state after a successful apply; \
+             next pass may attempt an unnecessary rollback"
+        );
+    }
     outcome.applied = true;
     outcome
 }
@@ -313,6 +356,10 @@ mod tests {
 
     const HOSTNAME: &str = "workstation-01";
     const IFACE: &str = "wg0";
+    // MockSystemOps::preflight ignores this value unless a test asserts
+    // on it directly; it's only threaded through for signature parity
+    // with the real storage endpoint host.
+    const STORAGE_HOST: &str = "storage.example.com";
 
     fn conf_path() -> PathBuf {
         PathBuf::from("/etc/wireguard/wg0.conf")
@@ -359,7 +406,16 @@ mod tests {
         let bytes = valid_conf(1400);
         publish(&storage, &base32::random_id(), &bytes);
 
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert!(outcome.applied);
         assert_eq!(ops.get_file(&conf_path()).unwrap(), bytes);
@@ -373,10 +429,28 @@ mod tests {
         let bytes = valid_conf(1400);
         publish(&storage, &base32::random_id(), &bytes);
 
-        run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
         let calls_before = ops.calls().len();
 
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
         assert!(outcome.no_op);
         assert!(!outcome.applied);
         assert_eq!(ops.calls().len(), calls_before); // no additional up/down calls
@@ -389,8 +463,26 @@ mod tests {
         let bytes = valid_conf(1400);
         publish(&storage, &base32::random_id(), &bytes);
 
-        run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), true).await;
+        run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            true,
+            STORAGE_HOST,
+        )
+        .await;
         assert!(outcome.applied);
     }
 
@@ -399,15 +491,125 @@ mod tests {
         let storage = MockReadStorage::new();
         let ops = MockSystemOps::new();
         publish(&storage, &base32::random_id(), &valid_conf(1400));
-        run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
 
         let new_bytes = valid_conf(1500);
         publish(&storage, &base32::random_id(), &new_bytes);
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
 
         assert!(outcome.applied);
         assert_eq!(ops.get_file(&conf_path()).unwrap(), new_bytes);
         assert!(ops.calls().contains(&format!("down:{IFACE}")));
+    }
+
+    /// Count of `up:`/`down:` netlink-affecting calls the mock recorded —
+    /// used instead of a raw call-count comparison since a preflight
+    /// check is also recorded on every apply attempt.
+    fn interface_call_count(ops: &MockSystemOps) -> usize {
+        ops.calls()
+            .iter()
+            .filter(|c| c.starts_with("up:") || c.starts_with("down:"))
+            .count()
+    }
+
+    #[tokio::test]
+    async fn failed_pending_state_persist_aborts_before_teardown() {
+        let storage = MockReadStorage::new();
+        let ops = MockSystemOps::new();
+        let old_bytes = valid_conf(1400);
+        publish(&storage, &base32::random_id(), &old_bytes);
+        run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
+        let calls_before = interface_call_count(&ops);
+
+        publish(&storage, &base32::random_id(), &valid_conf(1500));
+        *ops.fail_next_write.lock().unwrap() = 1; // fail the pending-state write
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
+
+        assert!(outcome.error.is_some());
+        assert!(!outcome.applied);
+        // No teardown/apply attempted: an unpersisted pending marker must
+        // not be followed by tearing down the working interface.
+        assert_eq!(interface_call_count(&ops), calls_before);
+        assert_eq!(ops.get_file(&conf_path()).unwrap(), old_bytes);
+    }
+
+    #[tokio::test]
+    async fn failed_preflight_aborts_before_any_mutation() {
+        let storage = MockReadStorage::new();
+        let ops = MockSystemOps::new();
+        let old_bytes = valid_conf(1400);
+        publish(&storage, &base32::random_id(), &old_bytes);
+        run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
+        let calls_before = interface_call_count(&ops);
+
+        publish(&storage, &base32::random_id(), &valid_conf(1500));
+        *ops.fail_next_preflight.lock().unwrap() = 1;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
+
+        assert!(outcome.error.is_some());
+        assert!(!outcome.applied);
+        // Keep the current configuration untouched on any preflight
+        // error (wg-client.md §6): no backup, no pending marker, no
+        // teardown/apply, and conf_path still holds the old bytes.
+        assert_eq!(interface_call_count(&ops), calls_before);
+        assert_eq!(ops.get_file(&conf_path()).unwrap(), old_bytes);
+        // First install had nothing to back up from, so no backup should
+        // exist before or after this failed (preflight-rejected) attempt.
+        assert!(!ops.file_exists(&backup_path_for(&conf_path())));
     }
 
     #[tokio::test]
@@ -416,11 +618,29 @@ mod tests {
         let ops = MockSystemOps::new();
         let old_bytes = valid_conf(1400);
         publish(&storage, &base32::random_id(), &old_bytes);
-        run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
 
         publish(&storage, &base32::random_id(), &valid_conf(1500));
         *ops.fail_next_apply.lock().unwrap() = 1;
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
 
         assert!(outcome.error.is_some());
         assert!(outcome.rollback_attempted);
@@ -435,7 +655,16 @@ mod tests {
         publish(&storage, &base32::random_id(), &valid_conf(1400));
         *ops.fail_next_apply.lock().unwrap() = 1;
 
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
         assert!(outcome.error.is_some());
         assert!(outcome.rollback_attempted);
         assert!(!outcome.rollback_succeeded);
@@ -461,7 +690,16 @@ mod tests {
         );
 
         publish(&storage, &base32::random_id(), &backup_bytes);
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
 
         assert!(outcome.recovered_pending);
         // Recovery restores the backup first; the interface is then
@@ -485,7 +723,16 @@ mod tests {
         let bytes = valid_conf(1400);
         ops.set_file(&conf_path(), bytes.clone());
 
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
 
         assert!(outcome.restored_local);
         assert!(ops.calls().contains(&format!("up:{IFACE}")));
@@ -503,11 +750,23 @@ mod tests {
         let bytes = valid_conf(1400);
         publish(&storage, &base32::random_id(), &bytes);
 
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
 
         assert!(!outcome.restored_local);
         assert!(outcome.applied);
-        assert_eq!(ops.calls(), vec![format!("up:{IFACE}")]);
+        assert_eq!(
+            ops.calls(),
+            vec!["preflight".to_string(), format!("up:{IFACE}")]
+        );
     }
 
     #[tokio::test]
@@ -522,7 +781,16 @@ mod tests {
         let bytes = valid_conf(1400);
         publish(&storage, &base32::random_id(), &bytes);
 
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
 
         assert!(!outcome.restored_local);
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
@@ -552,7 +820,16 @@ mod tests {
             valid_conf(1400),
         );
 
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
         assert!(outcome.error.unwrap().contains("digest mismatch"));
     }
 
@@ -562,7 +839,16 @@ mod tests {
         let ops = MockSystemOps::new();
         publish(&storage, &base32::random_id(), &valid_conf(1400));
 
-        let outcome = run_once(&storage, &ops, "someone-else", IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            "someone-else",
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
         assert!(outcome.error.unwrap().contains("not registered"));
     }
 
@@ -585,7 +871,16 @@ mod tests {
         storage.set("current.json", serde_json::to_vec(&doc).unwrap());
         // Deliberately never publish the generation file itself.
 
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
         assert!(outcome.error.unwrap().contains("exhausted"));
     }
 
@@ -596,7 +891,16 @@ mod tests {
         let bad = b"not a valid wg-quick config".to_vec();
         publish(&storage, &base32::random_id(), &bad);
 
-        let outcome = run_once(&storage, &ops, HOSTNAME, IFACE, &conf_path(), false).await;
+        let outcome = run_once(
+            &storage,
+            &ops,
+            HOSTNAME,
+            IFACE,
+            &conf_path(),
+            false,
+            STORAGE_HOST,
+        )
+        .await;
         assert!(outcome.error.unwrap().contains("failed validation"));
         assert!(ops.get_file(&conf_path()).is_none());
     }

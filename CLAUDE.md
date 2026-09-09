@@ -154,14 +154,18 @@ it rather than committing by hand.
   are migrated to the netlink/`wireguard-control` design described above
   and in `docs/wg-client.md` (no `wg`/`wg-quick`/`ip` subprocess; the
   interface-missing check runs unconditionally at the start of every pass,
-  not only inside `state.pending`). This has **not yet been exercised
-  against a real kernel interface** — only the mocked `SystemOps` unit
-  tests in `sync.rs` cover it so far. Run `docker-tests/` before trusting
-  this on a real fleet; per `docs/milestones.md` §4's "Real interface
-  application" test plan, it hasn't been confirmed there yet that
-  `DeviceUpdate::replace_peers()` actually drops a removed peer, that
-  routes get installed for every peer's `AllowedIPs`, or that teardown
-  (`Device::delete`) leaves a clean kernel state for the next apply.
+  not only inside `state.pending`), and `docker-tests/` has confirmed this
+  against real kernel interfaces: device creation, full peer replacement
+  on rotation, address/route installation, hub-and-spoke connectivity,
+  and the local-first restore firing correctly during the SIGKILL/recovery
+  chaos scenario. Not yet covered by that harness: running as a truly
+  unprivileged `CAP_NET_ADMIN`-only user (containers there still run as
+  root), and DNS/`resolvconf` integration and route-conflict preflight
+  remain unimplemented regardless (see the two bullets above/below).
+  `wireguard-control`/`netlink-request` are git-pinned to a specific
+  innernet commit rather than a crates.io release — see the comment in
+  `wg-client/Cargo.toml` for why, and re-pin by hand if innernet cuts a
+  matching release or moves its `main` branch further.
 - M6's fuzzing is a dependency-free PRNG mutation stress test
   (`wg-common/tests/fuzz_like.rs`), not real `cargo-fuzz` — this
   environment has no `rustup`/nightly toolchain. Swap in real fuzz

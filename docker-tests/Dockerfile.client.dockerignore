@@ -1,0 +1,10 @@
+# Overrides the root .dockerignore for this build (Docker uses
+# <dockerfile-name>.dockerignore instead of the root file when present).
+# The root file excludes target/ for docker/'s from-source image, but
+# this Dockerfile copies a host-built target/release/wg-client, so it
+# must NOT be excluded here.
+.git/
+.claude/
+docker-tests/
+docker/
+*.md

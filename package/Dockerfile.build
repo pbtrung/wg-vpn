@@ -46,7 +46,11 @@ WORKDIR /build
 RUN git clone --depth 1 --branch "$WG_VPN_REF" "$WG_VPN_REPO" . \
     && cloned="$(git rev-parse HEAD)" \
     && if [ -n "$WG_VPN_COMMIT" ] && [ "$cloned" != "$WG_VPN_COMMIT" ]; then \
-         echo "expected to clone $WG_VPN_COMMIT (WG_VPN_REF=$WG_VPN_REF resolved to this by the caller) but got $cloned -- $WG_VPN_REF has since moved, or Docker's build cache is serving a stale clone from before it moved; rerun with --no-cache or delete/recreate the ref" >&2; \
+         echo "expected to clone $WG_VPN_COMMIT (what the caller" >&2; \
+         echo "resolved WG_VPN_REF=$WG_VPN_REF to) but got $cloned --" >&2; \
+         echo "$WG_VPN_REF has since moved, or Docker's build cache is" >&2; \
+         echo "serving a stale clone from before it moved; rerun with" >&2; \
+         echo "--no-cache or delete/recreate the ref" >&2; \
          exit 1; \
        fi
 

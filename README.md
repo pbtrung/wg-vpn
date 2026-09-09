@@ -109,12 +109,15 @@ device itself over netlink/UAPI, so a second controller managing the
 same interface would race it (`docs/wg-client.md` §3, §8).
 
 `wg-client.timer`'s `OnBootSec=5s` already runs a sync pass shortly
-after boot. That pass checks the interface directly against the kernel
-and restores it from the last-good local config whenever it's
-missing/down — including right after a reboot, even if the published
-generation's digest is unchanged — before it ever tries to reach storage
-(`wg-client/src/sync.rs`, `docs/wg-client.md` §6). No separate boot-restore
-unit is needed.
+after boot, and that pass is enough on its own -- no separate boot-restore
+unit is needed. It does two things, in order: first it checks the
+interface directly against the kernel and, if missing/down, restores it
+from the last-good local config with no network involved at all -- so
+the tunnel comes back immediately even if storage happens to be
+unreachable at that instant. It then still runs the normal remote
+discovery/fetch (`current.json`, this node's config, digest verify) like
+any other pass, and applies a newer generation on top if one is published
+(`wg-client/src/sync.rs`, `docs/wg-client.md` §6).
 
 See [`package/PKGBUILD`](package/PKGBUILD) for the package itself,
 [`package/Dockerfile.build`](package/Dockerfile.build) for how the

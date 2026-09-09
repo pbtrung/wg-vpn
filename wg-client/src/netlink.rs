@@ -43,7 +43,10 @@ pub fn interface_index(name: &str) -> Option<u32> {
 /// The interface name for a route's outbound interface index, best-effort
 /// (only used to make a preflight rejection message readable).
 pub fn if_name_from_index(index: u32) -> Option<String> {
-    let mut buf = [0i8; libc::IF_NAMESIZE];
+    // `c_char` is signed on x86_64 but unsigned on aarch64, so this must
+    // stay typed via `libc::c_char` rather than a hardcoded `i8`/`u8` for
+    // the cross-compile (package/Dockerfile.build) to work on both.
+    let mut buf = [0 as libc::c_char; libc::IF_NAMESIZE];
     let ptr = unsafe { libc::if_indextoname(index, buf.as_mut_ptr()) };
     if ptr.is_null() {
         return None;

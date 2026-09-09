@@ -12,8 +12,18 @@ Status: design only, no implementation yet.
 3. Reads `{bucket}/current.json` to discover the current generation, then
    downloads `nodes/{hostname}/{generation-id}.conf` from that bucket
    and verifies its digest (see [wg-server.md §10](./wg-server.md#10-upload-to-storage)).
-4. Brings the WireGuard interface down and back up using that file, so the
-   node picks up the latest topology/keys.
+4. Reconfigures the WireGuard interface directly from that file — creating
+   the kernel device if needed and pushing keys/peers/routes over netlink —
+   so the node picks up the latest topology/keys.
+
+`wg-client` talks to the kernel the way
+[innernet](https://github.com/tonarino/innernet) does: through the
+`wireguard-control` crate's netlink/UAPI calls, in-process. It does not
+shell out to `wg`, `wg-quick`, or any other external tool, and depends on
+neither Bash nor the `wireguard-tools` package being installed. `wg-quick`
+INI syntax remains the *storage/interchange format* — `wg-server` renders
+it and `wg-common` parses it — but no `wg-quick` binary is ever invoked to
+apply it; see §6 and §8.
 
 Each client runs **daily at 00:30**, while the stateless server runs
 **daily at 00:00**. Use a common scheduler timezone (UTC in these examples).
@@ -67,7 +77,9 @@ daemon sleep. Never unlink the lock file. Restrict `/run/wg-client` to root,
 reject symlinks, and close the lock descriptor on subprocess exec. Manage
 an interface in one network namespace and with one owner only: do not also
 enable `wg-quick@<iface>`, NetworkManager, or another tunnel controller for
-the same interface. A second invocation fails immediately with exit 1.
+the same interface — even though `wg-client` no longer invokes `wg-quick`
+itself, a second controller writing to the same netlink device would still
+race it. A second invocation fails immediately with exit 1.
 
 `/run` is typically tmpfs and does not survive a reboot, so `wg-client`
 must create `/run/wg-client` itself rather than assume it exists.
@@ -102,7 +114,7 @@ process could have pre-created.
 | `r2_config.session_token` | string | conditional | Required for temporary credentials such as scoped R2 tokens. Omit for a long-lived pair; when present it must be nonempty. All blank credentials in this example are deployment placeholders. |
 | `r2_config.region` | string | yes | `"auto"` for R2. |
 | `r2_config.bucket` | string | yes | Must match the bucket `wg-server` publishes to. |
-| `conf_path` | string (path) | yes | Absolute installation path in a trusted root-owned directory. Filename must be `<iface>.conf` with a Linux/wg-quick-compatible 1–15 character interface name matching `[a-zA-Z0-9_=+.-]+`, excluding `.` and `..`. The stem is used for kernel checks and locking. |
+| `conf_path` | string (path) | yes | Absolute installation path in a trusted root-owned directory. Filename must be `<iface>.conf` with a 1–15 character interface name (the Linux `IFNAMSIZ` limit) matching `[a-zA-Z0-9_=+.-]+`, excluding `.` and `..`. The stem is the interface name passed to netlink/UAPI calls and used for kernel checks and locking. |
 
 **`conf_path` is fixed across generations.** For example, each download
 from `nodes/workstation-01/<generation-id>.conf` is installed at the same
@@ -151,9 +163,38 @@ requesting a nonexistent object.
 The discovery object always has the fixed key **`current.json`** in the
 configured bucket. Its schema is defined in
 [wg-server.md §10](./wg-server.md#10-upload-to-storage). First acquire the
-interface lock, recover any pending local transaction, and restore a
-validated last good local config if the interface is absent. This boot
-recovery does not depend on storage availability. Then:
+interface lock and recover any pending local transaction (see "Local
+application" below).
+
+Then, independent of whether a transaction was pending, and **before any
+network call**, check whether the managed interface currently exists.
+Query the kernel directly for this on every pass — never assume a
+previous pass's result still holds — the same way
+[innernet](https://github.com/tonarino/innernet)'s client daemon
+re-checks `interface_is_up()` from the kernel on every single loop
+iteration rather than caching that answer between calls. If the interface
+is absent (most commonly: this is the first pass after a reboot, since a
+reboot clears the kernel's WireGuard devices but not the files on disk)
+and `conf_path` holds a file that still parses under the shared validator,
+bring the interface up directly from that file — innernet's daemon does
+the equivalent thing, reconfiguring the interface from its local
+`InterfaceConfig` (and, for peers, its locally cached last-known-good
+peer list) before it ever contacts its own coordination server. If
+`conf_path`'s content fails validation (e.g. corrupted), skip this local
+restore and fall through to discovery below, which will install a fresh,
+freshly-validated file if one is reachable.
+
+This local-first restore is what makes a reboot self-healing without
+depending on storage reachability at that instant, and without needing a
+separate boot-time unit (such as `wg-quick@<iface>`, §3/§7) layered on
+top of the scheduled sync: the tunnel comes back from `wg-client`'s own
+next run, using only what is already on disk, the same way innernet
+needs no separate boot mechanism beyond starting its one long-running
+daemon. The discovery/download steps below can still supersede this
+local copy with a newer generation once storage is reachable, but they
+are not what brings the interface up in the first place after a reboot.
+
+With the interface reconciled from local state, discovery proceeds:
 
 1. Fetch and validate `current.json`. Read `current.id` and find this
    hostname in `current.nodes`. A missing/empty publication or absent
@@ -217,10 +258,16 @@ spaces; reject NUL and other control characters. Comments are informational,
 not an identity source.
 
 Explicitly reject `PreUp`, `PostUp`, `PreDown`, `PostDown`, `SaveConfig`,
-`Table`, and arbitrary shell text. `wg-quick strip` is not a validator: it
-removes some directives without checking keys or preventing hook execution
-([wg-quick implementation](https://git.zx2c4.com/wireguard-tools/tree/src/wg-quick/linux.bash)).
-Invoke tools with argument arrays, never with shell interpolation.
+`Table`, and arbitrary shell text. This isn't defense-in-depth around a
+shell-hook-capable applier — `wg-client` never hands the file to `wg-quick`
+or any other interpreter that would execute these directives — but the
+shared parser still rejects them outright rather than silently ignoring
+them, since a config that names them is not a config this fleet renders
+and warrants treating as untrusted. There is no `wg-quick strip`-style
+partial stripping step to lean on either way: `wg-common`'s parser is the
+only thing that ever reads these bytes, and it accepts or rejects the
+whole file. Any external command `wg-client` does invoke (e.g. `resolvconf`
+integration, §8) uses argument arrays, never shell interpolation.
 
 Before teardown, resolve endpoint names with a finite deadline, verify
 required utilities and DNS integration, and check candidate routes against
@@ -237,10 +284,13 @@ Keep the current configuration on any preflight error.
 sequenceDiagram
     participant C as wg-client
     participant S as Storage (R2/S3)
-    participant W as wg-quick / kernel
+    participant W as kernel WireGuard device (netlink/UAPI via wireguard-control)
 
     C->>C: resolve hostname
-    C->>C: acquire interface lock, recover pending local apply<br/>restore last good config on boot if needed
+    C->>C: acquire interface lock, recover pending local apply
+    opt interface absent (e.g. after reboot) and conf_path parses OK
+        C->>W: bring up from last-good local conf_path (no network call)
+    end
     C->>S: GetObject current.json
     C->>S: GetObject nodes/{hostname}/{current.id}.conf
     Note over C,S: Verify digest, on a retired generation's 404,<br/>rediscover current with a bounded retry budget
@@ -260,10 +310,10 @@ sequenceDiagram
                 C->>C: stage file with mode 0600, fsync<br/>record pending apply and preserve last good config
                 C->>W: check managed WireGuard interface
                 opt interface currently up
-                    C->>W: wg-quick down <conf_path> (old config still installed)
+                    C->>W: tear down: clear peers/keys and remove addresses/routes<br/>(old config still installed at conf_path)
                 end
                 C->>C: install staged file at conf_path atomically<br/>and fsync parent directory
-                C->>W: wg-quick up <conf_path>
+                C->>W: bring up: create device if absent, then set<br/>private key/listen port/MTU, addresses, routes, and peers
                 C->>C: verify local state and management reachability
                 alt startup or verification fails
                     C->>C: restore last good local config if available
@@ -312,8 +362,9 @@ new apply after failed teardown and attempt recovery from the preserved
 local state. On first installation there may be no backup: clean up a
 failed partial startup and report failure without inventing a rollback.
 If recovery fails, retain recovery information and report a critical
-failure. `wg-quick up` success establishes local configuration, not proof
-that every peer has adopted compatible keys or is reachable.
+failure. Successfully pushing the new keys/peers/addresses over
+netlink/UAPI establishes local configuration, not proof that every peer
+has adopted compatible keys or is reachable.
 
 After startup, verify managed local state and perform a bounded DNS/storage
 reachability check before marking the apply successful. Roll back a
@@ -388,10 +439,12 @@ Key properties this preserves:
   same bytes for this node. Compare configuration content and applied state,
   not generation IDs alone, when deciding whether to reapply.
 
-`wg-quick` is invoked directly against `conf_path` (not an interface name
-looked up under `/etc/wireguard`), since `conf_path` is user-configurable
-and may not live in `/etc/wireguard` at all. `wg-quick up /path/to/wg0.conf`
-and `wg-quick down /path/to/wg0.conf` both accept a path directly.
+The interface name used for every netlink/UAPI call is the validated stem
+of `conf_path` (§4), never a name looked up under `/etc/wireguard` by
+convention — `conf_path` is user-configurable and may not live there at
+all. There is no `wg-quick`-style CLI in between accepting either a path
+or an interface name: `wg-client` talks to the kernel device directly, so
+`conf_path` only ever needs to resolve to the interface name it encodes.
 
 ## 7. Scheduling and daemon mode
 
@@ -400,7 +453,13 @@ For root's crontab on a host whose cron runs in UTC:
 
 ```cron
 30 0 * * * /usr/local/bin/wg-client sync --config /etc/wg-client/config.json --once
+@reboot sleep 5 && /usr/local/bin/wg-client sync --config /etc/wg-client/config.json --once
 ```
+
+The `@reboot` line is cron's equivalent of the systemd timer's
+`OnBootSec` below — it's what restores the tunnel after a reboot via §6's
+local-first interface check, rather than leaving it down until the next
+`30 0 * * *` slot.
 
 Use one scheduling mechanism per interface. For systemd, install the
 following oneshot service and timer:
@@ -426,6 +485,7 @@ LimitCORE=0
 ```ini
 # /etc/systemd/system/wg-client.timer
 [Timer]
+OnBootSec=5s
 OnCalendar=*-*-* 00:30:00 UTC
 Persistent=true
 RandomizedDelaySec=0
@@ -437,16 +497,27 @@ WantedBy=timers.target
 ```
 
 Enable the timer, without also enabling a daemon or `wg-quick@wg0` service
-for the same interface. The timer starts a new oneshot pass when due;
+for the same interface — even though `wg-client` manages the interface
+itself now, a second controller pointed at the same device is still a
+conflicting owner (§3). The timer starts a new oneshot pass when due;
 there is no `RemainAfterExit` setting that would keep it active forever.
 The calendar timer preserves the thirty-minute offset from daily server
 slots at 00:00. `Persistent=true` runs one catch-up pass after a missed slot
 while the timer was inactive; it does not replay every missed publication.
-If a reboot occurs after a completed daily slot, the timer alone waits
-until the next slot. Start the oneshot service explicitly when immediate
-local tunnel recovery is required; recovery runs at the start of a pass.
-Actual startup/execution delays can still occur, so client discovery and
-retention recovery do not rely on exact wall-clock alignment.
+
+`OnBootSec=5s` additionally runs one pass shortly after every boot, on top
+of the daily calendar slot. This is what actually restores the tunnel
+after a reboot, and it's why no separate boot-time unit (`wg-quick@wg0` or
+otherwise) is needed: that pass's local-first interface check (§6) brings
+the interface back up from the last-good `conf_path` immediately, using
+only what's already on disk, before it even attempts discovery — the same
+role innernet's always-running daemon fills by reconciling interface
+state from local config at the start of every loop iteration, boot
+included. Without `OnBootSec`, a reboot between calendar slots would
+otherwise leave the tunnel down until the next `OnCalendar` firing, since
+nothing else would trigger a pass in between. Actual startup/execution
+delays can still occur, so client discovery and retention recovery do not
+rely on exact wall-clock alignment.
 
 An optional relative-interval daemon runs the same single-pass logic in a
 loop. Deployments requiring the daily 00:30 slots use the calendar timer
@@ -492,8 +563,11 @@ WantedBy=multi-user.target
 ```
 
 `KillMode=mixed` delivers the initial stop signal to the client so it can
-coordinate child processes; the default control-group mode would also
-signal an in-progress `wg-quick`. `TimeoutStopSec` exceeds the bounded
+coordinate any child process it has spawned (e.g. a `resolvconf`
+integration helper, §8); interface configuration itself is in-process
+netlink/UAPI calls with nothing external to signal, but the default
+control-group mode would still kill such a helper out from under an
+in-progress local transaction. `TimeoutStopSec` exceeds the bounded
 apply/recovery phase. For cron/terminal execution, put subprocesses in a
 separate process group and forward/cancel signals deliberately, so a
 terminal interrupt cannot bypass this coordination. Fatal local setup
@@ -501,23 +575,41 @@ errors exit with code 2; transient failures continue on later passes.
 
 ## 8. Privileges
 
-V1 targets Linux and runs as root. The stock Linux `wg-quick` script invokes
-`sudo` for a non-root caller, so possession of `CAP_NET_ADMIN` alone is not
-a supported execution mode. Check root privileges, WireGuard kernel
-support, network-namespace access, and ownership/write access to the
-configuration, state, and lock directories before touching an interface.
+V1 targets Linux. Interface creation and configuration go through direct
+netlink/UAPI calls — via the `wireguard-control` crate, the same mechanism
+[innernet](https://github.com/tonarino/innernet) uses — rather than a
+`wg-quick`-style script that re-execs itself under `sudo` for a non-root
+caller. This makes `CAP_NET_ADMIN` the actual requirement, not root
+specifically: an operator can run `wg-client` as an unprivileged user
+granted `CAP_NET_ADMIN` (e.g. a systemd `AmbientCapabilities=CAP_NET_ADMIN`
++ `CapabilityBoundingSet=CAP_NET_ADMIN` unit override), instead of the
+`wg-quick`-only-supported-as-root model. Root remains the default, simplest
+deployment (the packaged systemd units run as `User=root`) and is required
+regardless when `conf_path`/state/lock directories are only writable by
+root. Check for `CAP_NET_ADMIN` (root or otherwise), WireGuard kernel
+support (or the `wireguard` genl netlink family), network-namespace access,
+and ownership/write access to the configuration, state, and lock
+directories before touching an interface.
 
-Runtime prerequisites include `wg`, `wg-quick`, Bash, `ip` (iproute2), and
-the utilities used by the installed `wg-quick`. Configurations with `DNS`
-also require a compatible `resolvconf` implementation/integration. Use
-trusted absolute executable paths and a controlled PATH/environment;
-preflight these dependencies before teardown. A capability-only service
-would need a different helper design and is outside v1.
+There is no runtime dependency on `wg`, `wg-quick`, or Bash: no
+`wireguard-tools` package is required, and interface bring-up/teardown
+never spawns an external process. Address and route management on the
+interface goes through the same crate's rtnetlink calls. Configurations
+with `DNS` are the one place that still needs an external integration —
+a compatible `resolvconf` implementation — since DNS resolution is a
+host-wide, not per-interface-netlink, concern; preflight that dependency
+before teardown, invoke it with argument arrays only, and use trusted
+absolute paths and a controlled PATH/environment for it. A capability-only
+service still needs write access to the DNS integration's own state
+(e.g. `/etc/resolv.conf` or its resolvconf hook directory), which may
+require broader privileges than `CAP_NET_ADMIN` alone depending on the
+host's resolver setup.
 
 ## 9. Failure modes & resilience summary
 
 | Failure | Behavior |
 |---|---|
+| Interface absent at pass start (e.g. the first pass after a reboot) | Restore immediately from the last-good local `conf_path`, before any network call, independent of storage reachability (§6; mirrors [innernet](https://github.com/tonarino/innernet)'s local-config-first `fetch()`). Discovery below can still supersede it with a newer generation once storage is reachable. |
 | Storage endpoint unreachable before apply | Bounded retries (§6); leave the existing/restored tunnel running and fail this pass. Retry on the next schedule. |
 | Credentials invalid/expired | Fail the pass; reload atomically renewed credentials on the next pass. Distinguish ambiguous configuration 403s as specified in §6. |
 | No current generation or hostname absent from current | Report no publication/not registered; keep local state, never fetch previous as an automatic fallback. |
@@ -540,8 +632,9 @@ would need a different helper design and is outside v1.
   Secret-bearing configuration must not be baked into shared/public images.
 - The downloaded `.conf` at `conf_path` contains this node's private key
   and the preshared keys for its peers. `wg-client` sets `0600` /
-  root-owned permissions explicitly on write, rather than relying on
-  `wg-quick`'s own defaults.
+  root-owned permissions explicitly on write, rather than relying on any
+  external tool's file-permission defaults — there is no `wg-quick`
+  writing this file to inherit defaults from in the first place.
 - Create config, backup, metadata, and temporary files with mode `0600`
   from the first write, under root-owned directories inaccessible for
   untrusted writes. Reject symlinks and non-regular files; use exclusive
@@ -554,9 +647,12 @@ would need a different helper design and is outside v1.
 - Enforce HTTPS and certificate verification in application code. Keep
   discovery/config downloads on the configured authenticated endpoint.
 - Redact private keys, PSKs, credentials, request signing headers, complete
-  configs, and secret kernel fields from logs, parser diagnostics, and
-  subprocess output. Log sanitized field names and outcomes; never dump
-  `wg showconf` or `wg show ... dump` into logs. Disable core dumps.
+  configs, and secret kernel fields from logs, parser diagnostics, and any
+  DNS-integration subprocess output. Log sanitized field names and
+  outcomes; never dump a raw device/peer configuration (private keys and
+  PSKs included) into logs, whether read back via the `wireguard-control`
+  crate's own device-dump call or an external `wg show ... dump`. Disable
+  core dumps.
 
 ## 11. Dependencies (planned crates)
 
@@ -570,6 +666,7 @@ would need a different helper design and is outside v1.
 | `fd-lock` (or `fs2`) | `flock`-based single-instance guard |
 | `sha2` | SHA-256 digest computation over downloaded configuration bytes, compared against `current.json`'s published digest and the locally persisted applied-hash state (§6) |
 | `ipnet` | CIDR overlap checks against the live routing table during preflight (§6) — a client-specific use, separate from `wg-common`'s config-parsing use below |
+| `wireguard-control` (or equivalent netlink/UAPI crate) | In-process WireGuard device creation/configuration (private key, listen port, peers, `AllowedIPs`, keepalive) and interface address/route management via netlink — the same approach [innernet](https://github.com/tonarino/innernet) uses; replaces shelling out to `wg`/`wg-quick` (§6, §8) |
 | `wg-common` (shared crate, §3) | Strict config parser/validator, key validation, shared limits, and the canonical lowercase Crockford Base32 encoding for IDs/digests — the same implementation `wg-server` uses, so neither binary reimplements it independently |
 | `thiserror` / `anyhow` | Error types |
 | `tracing`, `tracing-subscriber` | Logging |

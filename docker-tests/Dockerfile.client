@@ -1,6 +1,12 @@
 # Runtime image for wg-client, reusing a host-built release binary
-# (network-sim/run.sh builds it first). Needs the real wg-quick/wg/ip
-# tooling to actually manage a kernel WireGuard interface.
+# (network-sim/run.sh builds it first). wg-client itself configures the
+# kernel WireGuard interface over netlink/UAPI and needs none of these at
+# runtime (docs/wg-client.md §8) -- they're here for the test harness, not
+# the binary: `bash` provides /bin/sh for run.sh's `docker compose exec ...
+# sh -c '...'` chaos scenario, `iputils` provides the `ping` run.sh execs
+# inside containers for connectivity assertions, and `wireguard-tools`/
+# `iproute2` are kept for manual `wg show`/`ip addr`/`ip route` inspection
+# (docker-tests/README.md "Run it").
 FROM archlinux:latest
 
 RUN pacman -Sy --noconfirm ca-certificates wireguard-tools iproute2 iputils bash \

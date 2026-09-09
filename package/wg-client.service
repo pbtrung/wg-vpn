@@ -8,10 +8,15 @@ After=network-online.target
 Type=oneshot
 ExecStart=/usr/bin/wg-client sync --config /etc/wg-client/config.json --once -v
 
-# Needs root: wg-client shells out to wg-quick/wg/ip, which manage a
-# kernel network interface (README.md "Requirements"). Adjust
-# ReadWritePaths below if your client config's conf_path isn't under
-# /etc/wireguard.
+# Runs as root by default (simplest deployment): wg-client configures the
+# kernel WireGuard interface itself over netlink/UAPI (no wg/wg-quick/ip
+# subprocess), which needs CAP_NET_ADMIN plus write access to conf_path's
+# directory (README.md "Requirements"; docs/wg-client.md §8). An operator
+# who wants to avoid root can instead run this unit as an unprivileged
+# user with `AmbientCapabilities=CAP_NET_ADMIN` and
+# `CapabilityBoundingSet=CAP_NET_ADMIN` added below, provided that user
+# also owns the config/state/lock directories. Adjust ReadWritePaths below
+# if your client config's conf_path isn't under /etc/wireguard.
 ProtectSystem=strict
 ProtectHome=true
 PrivateTmp=true

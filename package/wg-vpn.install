@@ -13,11 +13,14 @@ post_install() {
         sudo systemctl enable --now wg-server.timer
     Client: put your client JSON at /etc/wg-client/config.json, then:
         sudo systemctl enable --now wg-client.timer
-        sudo systemctl enable --now wg-quick@wg0   # MUST also enable this
-    wg-client.timer only re-syncs content changes -- it won't bring the
-    interface back up after a reboot on its own. wg-quick@wg0 is what
-    restores the tunnel at boot from the config wg-client already wrote
-    (substitute your actual interface name if conf_path isn't wg0.conf).
+    Do NOT also enable wg-quick@wg0 (or any other tunnel controller) for
+    the same interface -- wg-client configures the kernel WireGuard
+    device itself over netlink/UAPI, and a second controller managing the
+    same interface would race it (docs/wg-client.md §3, §8). The timer's
+    OnBootSec=5s already runs a sync pass shortly after boot, and
+    wg-client reconciles a missing/down interface on that pass even when
+    the on-disk config is unchanged, so no separate boot-restore unit is
+    needed.
     Both timers/services also work with `systemctl start` for a one-off
     run, and `journalctl -u wg-server.service` / `-u wg-client.service`
     for logs.

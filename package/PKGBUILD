@@ -6,7 +6,12 @@ pkgdesc="Hub-and-spoke WireGuard fleet manager (wg-server + wg-client)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/pbtrung/wg-vpn"
 license=('MIT')
-depends=('wireguard-tools' 'iproute2' 'iputils' 'bash')
+# wg-client configures the kernel WireGuard interface itself over
+# netlink/UAPI (docs/wg-client.md §8) -- no runtime dependency on
+# wg/wg-quick/ip/bash. Kept as optional for manual inspection only.
+depends=()
+optdepends=('wireguard-tools: manual `wg show` inspection of the interface'
+            'iproute2: manual `ip addr`/`ip route` inspection of the interface')
 backup=()
 install=wg-vpn.install
 # Prebuilt binaries from a separate release build, not compiled here --

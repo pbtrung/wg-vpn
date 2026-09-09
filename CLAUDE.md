@@ -6,9 +6,12 @@ made, not a replacement.
 
 ## What this is
 
-`wg-server` publishes per-node `wg-quick` configs for a hub-and-spoke
-WireGuard fleet to an S3-compatible bucket; `wg-client` runs on each node
-and applies its own config. Full specs: [`docs/wg-server.md`](docs/wg-server.md),
+`wg-server` publishes per-node WireGuard configs (rendered in
+`wg-quick`-compatible INI syntax, used only as a storage/interchange
+format) for a hub-and-spoke fleet to an S3-compatible bucket; `wg-client`
+runs on each node and applies its own config directly to the kernel over
+netlink/UAPI — the way [innernet](https://github.com/tonarino/innernet)
+does — rather than shelling out to `wg`/`wg-quick`. Full specs: [`docs/wg-server.md`](docs/wg-server.md),
 [`docs/wg-client.md`](docs/wg-client.md). Testing plan and milestone
 breakdown (M0–M6, this repo's actual commit history maps to it 1:1):
 [`docs/milestones.md`](docs/milestones.md).
@@ -19,21 +22,27 @@ decision changes, update the doc in the same change, not as a follow-up.
 
 ## Architecture
 
-- `wg-common/` — everything both binaries share: the strict `wg-quick`
-  parser/renderer (also self-validates `wg-server`'s own output before
-  upload), X25519/PSK key handling, topology schema + validation, the
-  peer-selection algorithm, the Crockford Base32 encoding for IDs/digests
-  (**not** RFC 4648 — see `wg-common/src/base32.rs`'s doc comment before
-  touching this), and the `current.json` discovery-pointer schema.
+- `wg-common/` — everything both binaries share: the strict
+  `wg-quick`-format parser/renderer (a storage/interchange format only —
+  see `docs/wg-server.md` §9; also self-validates `wg-server`'s own output
+  before upload), X25519/PSK key handling, topology schema + validation,
+  the peer-selection algorithm, the Crockford Base32 encoding for
+  IDs/digests (**not** RFC 4648 — see `wg-common/src/base32.rs`'s doc
+  comment before touching this), and the `current.json` discovery-pointer
+  schema.
 - `wg-server/` — `apply`/`validate`. Stateless: the bucket itself is the
   only durable state (immutable generations, a `current.json` pointer
   updated via conditional writes). No local state file, no derived
   secrets — see `docs/wg-server.md` §8 for why and how key
   reuse/rotation works without one.
 - `wg-client/` — `sync`. A `SystemOps` trait abstracts file I/O and
-  `wg-quick` invocation so the local transaction/rollback state machine
-  is unit-testable without root or a real interface; `RealSystemOps`
-  shells out to the actual `wg-quick`/`wg` binaries.
+  WireGuard interface configuration so the local transaction/rollback
+  state machine is unit-testable without root or a real interface;
+  `RealSystemOps` configures the kernel device directly via the
+  `wireguard-control` crate's netlink/UAPI calls — the way
+  [innernet](https://github.com/tonarino/innernet) does — instead of
+  shelling out to `wg`/`wg-quick` (see `docs/wg-client.md` §8 for the
+  resulting `CAP_NET_ADMIN`-vs-root privilege story).
 - `docker-tests/` — the one place that exercises real kernel WireGuard
   interfaces end to end. See its own README. This is where a real bug
   was actually found (a panicking `aws-sdk-s3` credentials call that
@@ -61,10 +70,11 @@ decision changes, update the doc in the same change, not as a follow-up.
 
 Both `wg-server` and `wg-client` put a trait between their core logic and
 the outside world (`Storage`/`ReadStorage` for S3, `SystemOps` for
-files/`wg-quick`), with an in-memory mock implementation under
-`#[cfg(test)]`. Add new logic tests against the mock; only exercise the
-real AWS SDK client construction and real `wg-quick` behavior through
-`docker-tests/`. This is deliberate (see `docs/milestones.md` §3's
+files/interface configuration), with an in-memory mock implementation
+under `#[cfg(test)]`. Add new logic tests against the mock; only exercise
+the real AWS SDK client construction and real kernel netlink/WireGuard
+behavior through `docker-tests/`. This is deliberate (see
+`docs/milestones.md` §3's
 "explicit host-operation test adapter") — don't reach for `docker-tests/`
 to test something the mock can express, but don't assume the mock alone
 proves a change works, either — it doesn't touch the real SDK config
@@ -115,6 +125,17 @@ it rather than committing by hand.
   flag is set before teardown and only cleared after the new config is
   confirmed up (or a rollback to the backup succeeds) — see
   `wg-client/src/sync.rs`.
+- **Boot/restart recovery checks the kernel interface first, before any
+  network call, on every sync pass — not just when a transaction was left
+  pending.** If the interface is missing (typically: first pass after a
+  reboot) and `conf_path` still parses, `wg-client` reapplies it directly
+  from that local file, the same way
+  [innernet](https://github.com/tonarino/innernet)'s daemon re-checks and
+  restores interface state from local config on every loop iteration
+  before contacting its server. This is why the packaged
+  `wg-client.timer` has `OnBootSec=5s` and why enabling a separate
+  `wg-quick@<iface>` unit for the same interface is wrong, not just
+  redundant (`docs/wg-client.md` §6–§7).
 
 ## Known simplifications (not bugs, but don't assume more coverage than exists)
 
@@ -129,6 +150,25 @@ it rather than committing by hand.
 - `r2_config.endpoint` HTTPS-only enforcement described in the docs isn't
   implemented in code (`docker-tests/` deliberately uses plain HTTP to
   talk to local MinIO).
+- **Pending migration: the docs (`docs/wg-client.md`, this file) describe
+  the target design — `wireguard-control`/netlink instead of shelling out
+  to `wg-quick`/`wg`, plus a boot-independent local interface check on
+  every pass — but `wg-client/src/system.rs`'s `RealSystemOps` and
+  `wg-client/src/sync.rs`'s `run_once` are not yet migrated to match.**
+  Concretely: (1) `RealSystemOps` still spawns the real `wg-quick`
+  binary; (2) `run_once` only restores the interface from local state
+  inside the `state.pending` branch — the general "interface absent, no
+  pending transaction" case (e.g. an ordinary reboot) still falls through
+  to `discover_and_download` first, so it depends on storage being
+  reachable, contrary to what §6 now documents. Because of (1),
+  `package/PKGBUILD`'s `depends=()`/`optdepends` and
+  `docker-tests/Dockerfile.client`'s comment (updated to the target,
+  no-`wg-quick`-required model) are **ahead of the actual binary** —
+  don't ship/release the package as-is until `RealSystemOps` is migrated,
+  or the installed binary will fail at runtime with `wireguard-tools`
+  treated as optional. Do the `wg-client` code migration (system.rs +
+  sync.rs) before or together with any release that carries these
+  packaging changes.
 - M6's fuzzing is a dependency-free PRNG mutation stress test
   (`wg-common/tests/fuzz_like.rs`), not real `cargo-fuzz` — this
   environment has no `rustup`/nightly toolchain. Swap in real fuzz

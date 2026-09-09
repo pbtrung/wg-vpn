@@ -294,21 +294,32 @@ Test binary-specific decisions in their owning crates as listed below.
 ### Supported execution mode
 
 Use rootful Linux Docker on runners with WireGuard kernel support already
-available. Run node containers as root with `CAP_NET_ADMIN`, isolated
-network namespaces, and the trusted `wg`, `wg-quick`, Bash, and iproute2
-utilities required by [wg-client.md §8](./wg-client.md#8-privileges).
-Fixtures with `DNS` also need a compatible `resolvconf` integration.
-Preflight runner support before the suite; missing infrastructure is not
-a passing network test. Containers need no module-loading privilege.
+available. Run node containers with `CAP_NET_ADMIN` and isolated network
+namespaces, per [wg-client.md §8](./wg-client.md#8-privileges) — `wg-client`
+itself needs only `CAP_NET_ADMIN` (root remains the default packaged
+deployment, but is not required by the interface-configuration path
+anymore) since it configures the kernel device directly over netlink/UAPI
+via `wireguard-control`, the same way
+[innernet](https://github.com/tonarino/innernet) does, rather than
+shelling out to `wg`/`wg-quick`. Containers therefore need no
+`wireguard-tools` package or Bash for the client to function; keep `wg`
+installed anyway for manual inspection (`wg show`, etc., per
+`docker-tests/README.md`) and iproute2 for fixture setup/debugging outside
+the client's own netlink calls. Fixtures with `DNS` also need a compatible
+`resolvconf` integration. Preflight runner support before the suite;
+missing infrastructure is not a passing network test. Containers need no
+module-loading privilege.
 
 BoringTun is not the v1 acceptance harness: the client requires kernel
 support. Any future userspace matrix requires an explicit client support
-decision first. Stock `wg-quick` tries the kernel before falling back to
-`WG_QUICK_USERSPACE_IMPLEMENTATION`; installing a daemon does not select
-it or force userspace on a kernel-capable host
-([wg-quick source](https://git.zx2c4.com/wireguard-tools/tree/src/wg-quick/linux.bash)).
-Record kernel, tools, image versions, and actual interface implementation
-with test results.
+decision first — `wireguard-control`'s netlink/UAPI path goes straight to
+the kernel device with no automatic userspace fallback (unlike stock
+`wg-quick`, which tries the kernel before falling back to
+`WG_QUICK_USERSPACE_IMPLEMENTATION`); adding userspace support here would
+mean explicitly wiring in a userspace backend (e.g. embedding BoringTun),
+not installing a daemon that gets picked up implicitly. Record kernel,
+tools, image versions, and actual interface implementation with test
+results.
 
 ### Topology fixtures
 

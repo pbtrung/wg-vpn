@@ -13,8 +13,12 @@ The storage bucket holds all durable publication state. The tool:
 2. Generates WireGuard key material (private/public keypair per node,
    preshared key per allowed connection) — all randomly generated, never
    supplied by the operator.
-3. Renders one `wg-quick`-format `.conf` file per node, encoding the correct
-   set of peers for that node.
+3. Renders one `.conf` file per node in `wg-quick`-compatible INI syntax,
+   encoding the correct set of peers for that node. This is purely an
+   interchange/storage format — `wg-client` never runs it through
+   `wg-quick`; it parses the file and pushes the result to the kernel
+   directly over netlink/UAPI (see
+   [wg-client.md §1](./wg-client.md#1-purpose)).
 4. Uploads a complete immutable generation to an S3-compatible bucket
    (Cloudflare R2 in the reference deployment), then publishes it through
    `current.json` (§10). Independent `wg-client` jobs pull the latest
@@ -50,16 +54,19 @@ active uploader's files.
   created by the operator ahead of time (see §12, Security considerations).
 - Does not rotate keys on a timer; rotation is a manual, operator-triggered
   action (see §8, Key management).
-- Does not provide full-tunnel/default-route VPN service, arbitrary
-  `wg-quick` shell hooks, or automatic gateway firewall/NAT configuration
-  in v1. Gateway forwarding and return routes are operator prerequisites.
+- Does not provide full-tunnel/default-route VPN service, arbitrary shell
+  hooks (`PreUp`/`PostUp`-style directives — rejected outright regardless
+  of applier, see [wg-client.md §6](./wg-client.md#6-sync-algorithm)), or
+  automatic gateway firewall/NAT configuration in v1. Gateway forwarding
+  and return routes are operator prerequisites.
 
 ## 3. Project layout (proposed workspace)
 
 ```
 wg-vpn/
 ├── Cargo.toml         # workspace root
-├── wg-common/         # shared: S3 client wrapper, wg-quick renderer,
+├── wg-common/         # shared: S3 client wrapper, wg-quick-format renderer/
+│                      # parser (storage format only, not an applier),
 │                      # config types, error types
 ├── wg-server/         # this binary
 ├── wg-client/         # sibling binary — docs/wg-client.md
@@ -172,7 +179,7 @@ same one-generation retention policy.
 | `listen_port` | integer | no (default `51820`) | UDP listening port, `1`–`65535`; randomized port `0` is unsupported. |
 | `endpoint` | string or null | no | Reachable `IPv4:port`, `DNS-name:port`, or `[IPv6]:port`; port is `1`–`65535`. Omit/null for NAT'd nodes that initiate outbound handshakes. IPv6 transport is allowed even though v1 tunnel addresses are IPv4. |
 | `dns` | string | no | One resolver IP address, parsed and rendered canonically as `DNS =` in this node's own interface. No arbitrary text or search-domain directives. |
-| `mtu` | integer | no | `576`–`65535`, additionally limited by the host/underlay. Omit to use `wg-quick` auto-detection; setting it is an operator choice, not proof that the path supports it. |
+| `mtu` | integer | no | `576`–`65535`, additionally limited by the host/underlay. Omit to leave the interface at `wg-client`'s platform default MTU (there is no `wg-quick`-style automatic path-MTU probing once the interface is configured directly over netlink); setting it is an operator choice, not proof that the path supports it. |
 | `extra_allowed_ips` | string[] (IPv4 CIDR) | no (default `[]`) | Canonical site-subnet routes through this node. Subject to the non-overlap and default-route restrictions in §6. |
 | `persistent_keepalive` | integer or null | no | Local node's outbound keepalive interval, emitted in its own peer stanzas. `1`–`65535` seconds enables it; explicit `0` disables it. Missing/null defaults to `25` if the local endpoint is missing/null, and omits the line otherwise. |
 
@@ -379,7 +386,16 @@ back serves both purposes in the same pass.
    on unchanged passes. `--dry-run` reports these decisions without
    executing steps 6–8's writes or deletes.
 
-## 9. Rendered `wg-quick` format
+## 9. Rendered configuration format (`wg-quick`-compatible INI)
+
+This section describes the storage/interchange syntax only. Nothing in
+this repo executes it through `wg-quick`; `wg-client` parses it with
+`wg-common` and applies it directly to the kernel over netlink/UAPI (see
+[wg-client.md §1](./wg-client.md#1-purpose) and
+[§6](./wg-client.md#6-sync-algorithm)). It stays `wg-quick`-compatible
+syntax anyway: it's a well-understood, human-readable INI format, and
+keeping it lets an operator inspect a downloaded `.conf` with any
+existing WireGuard tooling if they ever need to.
 
 Peers are emitted in sorted hostname order for stable, diff-friendly
 output. Example for `master-us` (a master, so it peers with `master-eu` and

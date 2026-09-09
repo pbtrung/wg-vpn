@@ -5,10 +5,15 @@ Documentation=https://github.com/pbtrung/wg-vpn
 [Timer]
 # 00:30 UTC: half an hour after wg-server's daily 00:00 UTC apply
 # (docs/wg-server.md §10's worked example uses this same offset).
-OnBootSec=5s
+# RandomizedDelaySec spreads the fleet-wide daily slot out so nodes don't
+# all hit the bucket in the same second -- see wg-client-boot.timer for
+# why the boot-recovery trigger lives in a separate unit instead of an
+# OnBootSec= line here: RandomizedDelaySec applies to every trigger in a
+# [Timer] section, OnBootSec= included, so it would also jitter boot
+# recovery by up to this same delay if it were here.
 OnCalendar=*-*-* 00:30:00 UTC
 Persistent=true
-RandomizedDelaySec=10m
+RandomizedDelaySec=5m
 
 [Install]
 WantedBy=timers.target

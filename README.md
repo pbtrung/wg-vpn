@@ -88,19 +88,20 @@ makepkg
 ```
 
 This installs `wg-server`/`wg-client` to `/usr/bin`, and
-`wg-server.{service,timer}`/`wg-client.{service,timer}` to run them on
-the daily schedule `docs/wg-server.md` assumes (`wg-server` at 00:00
-UTC, `wg-client` at 00:30 UTC). `wg-server.service` rotates every
-node's key on every run — see `docker/README.md`'s "Rotation on every
-run" for what that means operationally; edit the unit's `ExecStart` if
-you want the non-rotating schedule the docs describe instead. After
+`wg-server.{service,timer}`/`wg-client.{service,timer,-boot.timer}` to
+run them on the daily schedule `docs/wg-server.md` assumes (`wg-server`
+at 00:00 UTC, `wg-client` at 00:30 UTC). `wg-server.service` rotates
+every node's key on every run — see `docker/README.md`'s "Rotation on
+every run" for what that means operationally; edit the unit's `ExecStart`
+if you want the non-rotating schedule the docs describe instead. After
 installing, drop your config into `/etc/wg-server/config.json` and/or
 `/etc/wg-client/config.json` (see Configure below) and enable the
-relevant timer:
+relevant timer(s):
 
 ```sh
-sudo systemctl enable --now wg-server.timer   # server hosts
-sudo systemctl enable --now wg-client.timer   # every node
+sudo systemctl enable --now wg-server.timer        # server hosts
+sudo systemctl enable --now wg-client.timer        # every node
+sudo systemctl enable --now wg-client-boot.timer   # every node, see below
 ```
 
 Do **not** also enable `wg-quick@wg0` (or any other tunnel controller)
@@ -108,16 +109,24 @@ for the same interface — `wg-client` configures the kernel WireGuard
 device itself over netlink/UAPI, so a second controller managing the
 same interface would race it (`docs/wg-client.md` §3, §8).
 
-`wg-client.timer`'s `OnBootSec=5s` already runs a sync pass shortly
-after boot, and that pass is enough on its own -- no separate boot-restore
-unit is needed. It does two things, in order: first it checks the
-interface directly against the kernel and, if missing/down, restores it
-from the last-good local config with no network involved at all -- so
-the tunnel comes back immediately even if storage happens to be
-unreachable at that instant. It then still runs the normal remote
-discovery/fetch (`current.json`, this node's config, digest verify) like
-any other pass, and applies a newer generation on top if one is published
-(`wg-client/src/sync.rs`, `docs/wg-client.md` §6).
+Enable both client timers, not just `wg-client.timer`: that one is the
+daily 00:30 UTC slot with a `RandomizedDelaySec` (see
+[`package/wg-client.timer`](package/wg-client.timer) for the current
+value) so a fleet doesn't hit the bucket in the same second;
+`wg-client-boot.timer` runs a sync pass shortly after boot instead,
+deliberately with **no** randomized delay. They're separate units because
+`RandomizedDelaySec` applies to every trigger in a `[Timer]` section — if
+`OnBootSec` were combined into `wg-client.timer`, that same fleet-spreading
+delay would also jitter boot recovery by just as much. The boot pass does
+two things, in order:
+first it checks the interface directly against the kernel and, if
+missing/down, restores it from the last-good local config with no
+network involved at all — so the tunnel comes back immediately even if
+storage happens to be unreachable at that instant. It then still runs
+the normal remote discovery/fetch (`current.json`, this node's config,
+digest verify) like any other pass, and applies a newer generation on
+top if one is published (`wg-client/src/sync.rs`, `docs/wg-client.md`
+§6, §7).
 
 See [`package/PKGBUILD`](package/PKGBUILD) for the package itself,
 [`package/Dockerfile.build`](package/Dockerfile.build) for how the

@@ -485,10 +485,9 @@ LimitCORE=0
 ```ini
 # /etc/systemd/system/wg-client.timer
 [Timer]
-OnBootSec=5s
 OnCalendar=*-*-* 00:30:00 UTC
 Persistent=true
-RandomizedDelaySec=0
+RandomizedDelaySec=10m
 AccuracySec=1s
 Unit=wg-client.service
 
@@ -496,28 +495,55 @@ Unit=wg-client.service
 WantedBy=timers.target
 ```
 
-Enable the timer, without also enabling a daemon or `wg-quick@wg0` service
-for the same interface — even though `wg-client` manages the interface
-itself now, a second controller pointed at the same device is still a
-conflicting owner (§3). The timer starts a new oneshot pass when due;
-there is no `RemainAfterExit` setting that would keep it active forever.
-The calendar timer preserves the thirty-minute offset from daily server
-slots at 00:00. `Persistent=true` runs one catch-up pass after a missed slot
-while the timer was inactive; it does not replay every missed publication.
+```ini
+# /etc/systemd/system/wg-client-boot.timer
+[Timer]
+OnBootSec=5s
+Unit=wg-client.service
 
-`OnBootSec=5s` additionally runs one pass shortly after every boot, on top
-of the daily calendar slot. This is what actually restores the tunnel
-after a reboot, and it's why no separate boot-time unit (`wg-quick@wg0` or
-otherwise) is needed: that pass's local-first interface check (§6) brings
-the interface back up from the last-good `conf_path` immediately, using
-only what's already on disk, before it even attempts discovery — the same
-role innernet's always-running daemon fills by reconciling interface
-state from local config at the start of every loop iteration, boot
-included. Without `OnBootSec`, a reboot between calendar slots would
-otherwise leave the tunnel down until the next `OnCalendar` firing, since
-nothing else would trigger a pass in between. Actual startup/execution
-delays can still occur, so client discovery and retention recovery do not
-rely on exact wall-clock alignment.
+[Install]
+WantedBy=timers.target
+```
+
+Enable both timers, without also enabling a daemon or `wg-quick@wg0`
+service for the same interface — even though `wg-client` manages the
+interface itself now, a second controller pointed at the same device is
+still a conflicting owner (§3). Each timer starts a new oneshot pass when
+due; there is no `RemainAfterExit` setting that would keep either active
+forever. `wg-client.timer`'s calendar entry preserves the thirty-minute
+offset from daily server slots at 00:00; `Persistent=true` runs one
+catch-up pass after a missed slot while the timer was inactive, without
+replaying every missed publication. `RandomizedDelaySec=10m` spreads that
+daily slot across a fleet so it doesn't all hit the bucket at once — pick
+a value proportional to fleet size, not necessarily this one.
+
+`wg-client-boot.timer`'s `OnBootSec=5s` runs one pass shortly after every
+boot, independent of the daily calendar slot. This is what actually
+restores the tunnel after a reboot, and it's why no separate boot-time
+unit (`wg-quick@wg0` or otherwise) is needed: that pass's local-first
+interface check (§6) brings the interface back up from the last-good
+`conf_path` immediately, using only what's already on disk, before it
+even attempts discovery — the same role innernet's always-running daemon
+fills by reconciling interface state from local config at the start of
+every loop iteration, boot included.
+
+This is deliberately **two separate timer units**, not one timer with
+both `OnCalendar` and `OnBootSec`. `RandomizedDelaySec` applies to every
+trigger configured in a `[Timer]` section — calendar and monotonic
+alike — so putting `OnBootSec` in the same unit as `wg-client.timer`'s
+fleet-spreading `RandomizedDelaySec` would also jitter boot recovery by
+up to that same delay
+([`systemd.timer(5)`](https://www.freedesktop.org/software/systemd/man/latest/systemd.timer.html#RandomizedDelaySec=):
+"the delay is added on top of the next determined elapsing time *or the
+service manager's startup time*, whichever is later" — the latter is
+`OnBootSec`'s reference point). Splitting them keeps the daily slot
+jittered while boot recovery stays prompt. Without `wg-client-boot.timer`,
+a reboot between calendar slots would otherwise leave the tunnel down
+until the next `OnCalendar` firing (or up to `RandomizedDelaySec` beyond
+it, if the two were combined), since nothing else would trigger a pass in
+between. Actual startup/execution delays can still occur, so client
+discovery and retention recovery do not rely on exact wall-clock
+alignment.
 
 An optional relative-interval daemon runs the same single-pass logic in a
 loop. Deployments requiring the daily 00:30 slots use the calendar timer

@@ -132,10 +132,18 @@ it rather than committing by hand.
   from that local file, the same way
   [innernet](https://github.com/tonarino/innernet)'s daemon re-checks and
   restores interface state from local config on every loop iteration
-  before contacting its server. This is why the packaged
-  `wg-client.timer` has `OnBootSec=5s` and why enabling a separate
-  `wg-quick@<iface>` unit for the same interface is wrong, not just
-  redundant (`docs/wg-client.md` §6–§7).
+  before contacting its server. This is why the boot-recovery trigger
+  exists at all, and why enabling a separate `wg-quick@<iface>` unit for
+  the same interface is wrong, not just redundant (`docs/wg-client.md`
+  §6–§7).
+- **The boot-recovery trigger (`OnBootSec=5s`) lives in its own
+  `wg-client-boot.timer`, separate from `wg-client.timer`'s daily
+  `OnCalendar` slot.** `RandomizedDelaySec` (used on `wg-client.timer` to
+  spread a fleet's daily bucket hits) applies to *every* trigger in a
+  `[Timer]` section, `OnBootSec` included — combining them would jitter
+  boot recovery by the same delay, silently defeating "shortly after
+  boot." Don't merge these two units back into one without re-solving
+  that (`docs/wg-client.md` §7, `package/wg-client-boot.timer`).
 
 ## Known simplifications (not bugs, but don't assume more coverage than exists)
 

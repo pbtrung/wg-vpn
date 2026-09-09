@@ -1,0 +1,15 @@
+[Unit]
+Description=Run wg-client shortly after boot (interface self-heal)
+Documentation=https://github.com/pbtrung/wg-vpn
+
+[Timer]
+# Deliberately no RandomizedDelaySec here: it applies to every trigger in
+# a [Timer] section, so putting OnBootSec in wg-client.timer alongside
+# its RandomizedDelaySec (there, for spreading out the daily 00:30 UTC
+# slot) would also delay boot recovery by that same amount -- defeating
+# the point of running promptly after boot (docs/wg-client.md §7).
+OnBootSec=5s
+Unit=wg-client.service
+
+[Install]
+WantedBy=timers.target

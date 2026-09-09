@@ -270,6 +270,27 @@ Test binary-specific decisions in their owning crates as listed below.
   Test fresh pass budgets, continuation after transient failure,
   interruptible sleep, and coordinated `SIGTERM`/`SIGINT` with controlled
   child processes.
+- **Local-first interface reconciliation, independent of the network**
+  (wg-quick/`wireguard-control` migration): with the mock `SystemOps`,
+  assert the missing/down-interface check and restore-from-`conf_path`
+  runs unconditionally at the start of every pass — before
+  `discover_and_download` is ever called, and regardless of whether
+  `state.pending` was set — mirroring
+  [innernet](https://github.com/tonarino/innernet)'s `fetch()`, which
+  re-checks and restores interface state from local config before
+  contacting its server on every loop iteration (`docs/wg-client.md` §6).
+  Cover: (1) interface absent, valid `conf_path`, storage call fails —
+  the interface must still come up from local state and the pass reports
+  the storage failure separately; (2) interface absent, no `conf_path`
+  yet (first-ever run) — no restore attempted, falls through to
+  discovery; (3) interface absent, `conf_path` present but fails
+  `wg_common::render::parse_wg_quick` (simulated corruption) — skip the
+  local restore rather than pushing unvalidated bytes to the interface,
+  fall through to discovery; (4) interface already up and matching — no
+  redundant reapply. This is a regression test for a real gap: before
+  this migration, the equivalent check only ran inside the
+  `state.pending` branch, so an ordinary reboot with no pending
+  transaction depended on storage being reachable to restore the tunnel.
 
 ### Retry and deadline checks (M1 server, M3 client)
 
@@ -394,11 +415,61 @@ successful probe cannot be satisfied by an underlay shortcut.
   actively verify connectivity. Also test skipping intermediate generations.
 - **Boot recovery and management protection**: restart a node with durable
   config/state but no interface or `/run` contents and unavailable storage;
-  restore its last-good tunnel before discovery. Reject candidate routes
-  capturing DNS, storage, transport endpoints, or another interface's
-  nondefault routes before teardown. An ordinary underlay default route
-  is allowed. Missing utilities/DNS integration also fail preflight.
-  Inject a post-start management failure and verify local rollback.
+  restore its last-good tunnel before discovery, over real netlink/UAPI,
+  with the MinIO container's network paused/unreachable during that
+  restore. Reject candidate routes capturing DNS, storage, transport
+  endpoints, or another interface's nondefault routes before teardown. An
+  ordinary underlay default route is allowed. Missing DNS integration
+  also fails preflight (route-conflict preflight and DNS/`resolvconf`
+  integration are themselves still open — see the "Known simplifications"
+  callout in `CLAUDE.md`; this bullet's DNS coverage activates once that
+  lands). Inject a post-start management failure and verify local
+  rollback.
+- **Real interface application (`wireguard-control`/netlink, replacing
+  `wg-quick`)**: exercise the actual `RealSystemOps` against real kernel
+  WireGuard interfaces, not the mock — this is precisely the class of bug
+  the mock cannot catch (`CLAUDE.md`'s "a panicking `aws-sdk-s3`
+  credentials call every mocked unit test was blind to" is the same
+  category of gap for netlink code). Check:
+  - **First application creates the device.** No interface exists yet;
+    a sync pass creates it (`DeviceUpdate::apply` per
+    `wireguard-control`'s documented "an interface with the provided
+    name will be created if one does not exist" behavior), sets the
+    private key/listen port, and the assigned tunnel address/MTU are
+    visible via `wg show`/`ip addr` afterward.
+  - **Full peer replacement, not additive merge.** `wireguard-control`'s
+    `DeviceUpdate::apply` merges into existing peers by default; a
+    rotation or topology change (a peer removed, or a peer's
+    `AllowedIPs` narrowed) must still result in exactly the desired peer
+    set on the kernel device afterward — assert this requires
+    `.replace_peers()` (and `.replace_allowed_ips()` per peer) rather
+    than relying on additive defaults, by publishing a config that drops
+    a previously-present peer and confirming `wg show` no longer lists
+    it.
+  - **Address and route idempotency.** Reapplying the same address
+    (`NLM_F_REPLACE | NLM_F_CREATE`) and the same routes (treating a
+    netlink `AlreadyExists` response as success, not failure) across
+    repeated passes with unchanged content must not error, matching the
+    existing no-flap requirement.
+  - **Routes cover every peer's `AllowedIPs`.** Both a peer's tunnel
+    `/32` and any `extra_allowed_ips` get a route via the interface —
+    the functional replacement for what `wg-quick`'s bundled `ip route
+    add` calls did — verified by actual reachability in the fixture, not
+    just by inspecting kernel state.
+  - **Teardown removes the whole device.** `Device::delete` (not a
+    partial peer/address/route unwind) leaves the interface absent from
+    `wg show`/`ip link`, so a subsequent bring-up starts from a clean
+    kernel state.
+  - **No `wg`/`wg-quick`/`ip` subprocess is spawned by the client
+    itself.** `wireguard-tools`/`iproute2` stay installed in
+    `docker-tests/Dockerfile.client` for manual inspection and fixture
+    setup only (`docs/milestones.md` §4 "Supported execution mode"); the
+    containers running `wg-client` should still pass this fixture with
+    those packages absent, as a cheap way to catch an accidental
+    subprocess reintroduced during future changes.
+  - **Privilege floor.** Run `wg-client` in a container granted only
+    `CAP_NET_ADMIN` (not root) and confirm the same fixture passes,
+    exercising the privilege story in `docs/wg-client.md` §8.
 
 ### Chaos scenarios (M5)
 

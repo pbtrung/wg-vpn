@@ -103,20 +103,18 @@ sudo systemctl enable --now wg-server.timer   # server hosts
 sudo systemctl enable --now wg-client.timer   # every node
 ```
 
-On client hosts you **must** also enable `wg-quick@wg0` (substitute
-your actual interface name if `conf_path` isn't `wg0.conf`):
+Do **not** also enable `wg-quick@wg0` (or any other tunnel controller)
+for the same interface — `wg-client` configures the kernel WireGuard
+device itself over netlink/UAPI, so a second controller managing the
+same interface would race it (`docs/wg-client.md` §3, §8).
 
-```sh
-sudo systemctl enable --now wg-quick@wg0
-```
-
-`wg-client.timer` only re-syncs *content changes* — if the currently
-published generation's digest matches what was last applied, `sync`
-no-ops without touching the interface at all (`wg-client/src/sync.rs`).
-That means after a reboot, with the tunnel down but the digest
-unchanged, `wg-client.timer` alone won't bring it back up until the
-generation next actually changes; `wg-quick@wg0` is what restores the
-tunnel immediately at boot from the config `wg-client` already wrote.
+`wg-client.timer`'s `OnBootSec=5s` already runs a sync pass shortly
+after boot. That pass checks the interface directly against the kernel
+and restores it from the last-good local config whenever it's
+missing/down — including right after a reboot, even if the published
+generation's digest is unchanged — before it ever tries to reach storage
+(`wg-client/src/sync.rs`, `docs/wg-client.md` §6). No separate boot-restore
+unit is needed.
 
 See [`package/PKGBUILD`](package/PKGBUILD) for the package itself,
 [`package/Dockerfile.build`](package/Dockerfile.build) for how the

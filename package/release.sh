@@ -18,7 +18,24 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 package_dir="$repo_root/package"
 dist_dir="$package_dir/dist"
 
-if ! git -C "$repo_root" rev-parse "$tag" >/dev/null 2>&1; then
+if git -C "$repo_root" rev-parse "$tag" >/dev/null 2>&1; then
+    # A tag from an earlier attempt at this same version (e.g. one that
+    # got created/pushed here but then failed during the Docker build
+    # below) is fine to reuse as-is. One left over from further back --
+    # HEAD has moved since -- must not be silently rebuilt: Dockerfile.build
+    # clones exactly this ref, so a stale tag means shipping stale code
+    # under this version number without any indication of the mismatch.
+    tag_commit="$(git -C "$repo_root" rev-parse "$tag")"
+    head_commit="$(git -C "$repo_root" rev-parse HEAD)"
+    if [[ "$tag_commit" != "$head_commit" ]]; then
+        echo "==> ${tag} already exists at ${tag_commit}, but HEAD is ${head_commit}" >&2
+        echo "    delete it first if you want to retag at HEAD:" >&2
+        echo "      git tag -d ${tag} && git push origin :refs/tags/${tag}" >&2
+        echo "    or move it to HEAD directly:" >&2
+        echo "      git tag -f ${tag} HEAD && git push --force origin refs/tags/${tag}" >&2
+        exit 1
+    fi
+else
     echo "==> tagging ${tag} at HEAD and pushing"
     git -C "$repo_root" tag "$tag"
     git -C "$repo_root" push origin "$tag"

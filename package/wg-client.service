@@ -3,10 +3,19 @@ Description=wg-vpn: sync this node's WireGuard config (one-shot)
 Documentation=https://github.com/pbtrung/wg-vpn
 Wants=network-online.target
 After=network-online.target
+# network-online.target going active doesn't guarantee DNS/WAN reachability
+# yet (e.g. NetworkManager-wait-online only confirms an IP/gateway), which
+# can race wg-client-boot.timer's 5s-after-boot pass on a slower link. Retry
+# a few times within a minute rather than waiting for the next scheduled
+# slot; the sync itself is safe to retry (idempotent "no change" on success).
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/wg-client sync --config /etc/wg-client/config.json --once -v
+Restart=on-failure
+RestartSec=5s
 
 # Runs as root by default (simplest deployment): wg-client configures the
 # kernel WireGuard interface itself over netlink/UAPI (no wg/wg-quick/ip

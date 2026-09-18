@@ -470,12 +470,16 @@ following oneshot service and timer:
 Description=Apply current WireGuard configuration
 After=network-online.target
 Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
 User=root
 UMask=0077
 ExecStart=/usr/local/bin/wg-client sync --config /etc/wg-client/config.json --once
+Restart=on-failure
+RestartSec=5s
 KillMode=mixed
 TimeoutStartSec=350s
 TimeoutStopSec=150s
@@ -526,6 +530,17 @@ interface check (§6) brings the interface back up from the last-good
 even attempts discovery — the same role innernet's always-running daemon
 fills by reconciling interface state from local config at the start of
 every loop iteration, boot included.
+
+`wg-client.service`'s `Restart=on-failure`/`StartLimitBurst=5` exists for
+this boot pass specifically: `network-online.target` becoming active only
+means a connection profile got an IP/gateway (that's as far as, e.g.,
+`NetworkManager-wait-online.service` checks), not that DNS or the WAN path
+to the bucket is actually reachable yet, and that can still lag a few
+seconds past `OnBootSec=5s` on a slow link. A single failed attempt would
+otherwise leave the tunnel down until the next `OnCalendar` slot; a few
+retries within a minute cover the common case where the network finishes
+coming up moments later. The sync itself is safe to retry — a pass that
+finds nothing new is a no-op.
 
 This is deliberately **two separate timer units**, not one timer with
 both `OnCalendar` and `OnBootSec`. `RandomizedDelaySec` applies to every

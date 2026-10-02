@@ -144,6 +144,17 @@ it rather than committing by hand.
   boot recovery by the same delay, silently defeating "shortly after
   boot." Don't merge these two units back into one without re-solving
   that (`docs/wg-client.md` §7, `package/wg-client-boot.timer`).
+- **Planned, not implemented: encrypted, signed publication (schema
+  v2, milestone M7).** Each node's file gets age-encrypted to the node's
+  own post-quantum hybrid recipient (`mlkem768x25519`) plus the server's,
+  and `current.json` becomes an Ed25519-signed envelope with a monotonic
+  `sequence` that clients use to reject replays. Design:
+  `docs/wg-server.md` §8/§10/§12 and `docs/wg-client.md` §4/§6. The
+  docs mark it as target design; the code is still schema v1, so that
+  difference is expected and not a bug. The Rust `age` crate (0.12.1)
+  doesn't ship `mlkem768x25519` yet. The plan is a `wg-common`
+  implementation interop-tested against Go age, swapped for upstream
+  once it lands.
 
 ## Known simplifications (not bugs, but don't assume more coverage than exists)
 

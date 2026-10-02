@@ -2,6 +2,13 @@
 
 Status: design only, no implementation yet.
 
+> **Encrypted, signed publication (discovery schema v2) is designed but
+> not implemented yet.** The parts of this document about `age_identities`,
+> `server_verify_keys`, `keygen`, signature and sequence checks, and
+> decryption (§3–§4, §6, §9–§11) are the target design. The current code
+> still implements schema v1. See
+> [wg-server.md §10](./wg-server.md#encryption-and-signing-schema-v2).
+
 ## 1. Purpose
 
 `wg-client` runs on every VPN node (master or spoke). It:
@@ -9,9 +16,11 @@ Status: design only, no implementation yet.
 1. Reads a small JSON config with read-only storage credentials and a
    local target path.
 2. Determines this node's own hostname.
-3. Reads `{bucket}/current.json` to discover the current generation, then
-   downloads `nodes/{hostname}/{generation-id}.conf` from that bucket
-   and verifies its digest (see [wg-server.md §10](./wg-server.md#10-upload-to-storage)).
+3. Reads `{bucket}/current.json`, verifies its signature against the
+   pinned server verify keys, and rejects a replayed older pointer. It
+   then downloads `nodes/{hostname}/{generation-id}.conf.age`, verifies
+   its digest, and decrypts it with this node's own age identity (see
+   [wg-server.md §10](./wg-server.md#10-upload-to-storage)).
 4. Reconfigures the WireGuard interface directly from that file — creating
    the kernel device if needed and pushing keys/peers/routes over netlink —
    so the node picks up the latest topology/keys.
@@ -40,8 +49,9 @@ with the server to catch up.
 
 ## 2. Non-goals
 
-- Does not generate keys or decide topology — it only applies what
-  `wg-server` published.
+- Does not generate WireGuard keys or decide topology — it only applies
+  what `wg-server` published. The one key it generates is its own age
+  identity (`keygen`, §3), whose private half never leaves the node.
 - Does not provision gateway forwarding, NAT, or site firewall policies.
   It applies the validated address/route/DNS subset in §6. Downloaded
   shell hooks and default-route configurations are rejected in v1.
@@ -53,7 +63,21 @@ with the server to catch up.
 
 ```
 wg-client sync --config <path> [--hostname <name>] [--once | --daemon] [--interval <duration>] [--force]
+wg-client keygen
 ```
+
+`keygen` makes no network call and reads no config. It generates a fresh
+`mlkem768x25519` age identity and prints one JSON object with two fields
+to stdout:
+- `age_identity` (`AGE-SECRET-KEY-PQ-1…`): goes into this node's
+  `age_identities` (§4);
+- `age_recipient` (`age1pq1…`): goes into the node's entry in the
+  server's topology
+  ([wg-server.md §5](./wg-server.md#nodesage_recipient)).
+
+Run it on the node itself, with a restrictive umask. Only the recipient
+ever leaves the node. Identities from the Go reference `age-keygen` in
+its post-quantum mode are equally valid.
 
 | Flag | Default | Meaning |
 |---|---|---|
@@ -103,6 +127,8 @@ process could have pre-created.
     "region": "auto",
     "bucket": "wg-confs"
   },
+  "age_identities": ["AGE-SECRET-KEY-PQ-1..."],
+  "server_verify_keys": ["<Base64 32-byte Ed25519 public key>"],
   "conf_path": "/etc/wireguard/wg0.conf"
 }
 ```
@@ -114,10 +140,12 @@ process could have pre-created.
 | `r2_config.session_token` | string | conditional | Required for temporary credentials such as scoped R2 tokens. Omit for a long-lived pair; when present it must be nonempty. All blank credentials in this example are deployment placeholders. |
 | `r2_config.region` | string | yes | `"auto"` for R2. |
 | `r2_config.bucket` | string | yes | Must match the bucket `wg-server` publishes to. |
+| `age_identities` | string[] | yes | 1–2 `mlkem768x25519` identities (`AGE-SECRET-KEY-PQ-1…`) for this node; every other type is rejected. Normally one. A second is present only while rotating the node's identity (wg-server.md §8 "Rotating publication keys"). Decryption tries each. These are secrets: the same file protections as the credentials apply. |
+| `server_verify_keys` | string[] | yes | 1–4 canonical Base64 32-byte Ed25519 public keys. A pointer is accepted if its signature verifies under **any** of them. More than one exists only during a signing-key rotation or a signature-algorithm upgrade. This is a trust anchor: provision it out of band, never from the bucket. |
 | `conf_path` | string (path) | yes | Absolute installation path in a trusted root-owned directory. Filename must be `<iface>.conf` with a 1–15 character interface name (the Linux `IFNAMSIZ` limit) matching `[a-zA-Z0-9_=+.-]+`, excluding `.` and `..`. The stem is the interface name passed to netlink/UAPI calls and used for kernel checks and locking. |
 
 **`conf_path` is fixed across generations.** For example, each download
-from `nodes/workstation-01/<generation-id>.conf` is installed at the same
+from `nodes/workstation-01/<generation-id>.conf.age` is decrypted and installed at the same
 `/etc/wireguard/wg0.conf`. Never append the generation ID to this path or
 derive the local interface name from the remote object filename. The
 backup stays `/etc/wireguard/wg0.conf.bak`; generation IDs belong only to
@@ -151,7 +179,7 @@ use `--hostname` when the system name differs from the registered label.
 
 The resolved value is validated against the same rule `wg-server` uses
 (`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`) before being used to build the
-object key `nodes/{hostname}/{generation-id}.conf`. A mismatch here
+object key `nodes/{hostname}/{generation-id}.conf.age`. A mismatch here
 (e.g. the hostname contains underscores or an FQDN suffix) is a
 configuration error — fail with a clear message rather than silently
 requesting a nonexistent object.
@@ -196,26 +224,60 @@ are not what brings the interface up in the first place after a reboot.
 
 With the interface reconciled from local state, discovery proceeds:
 
-1. Fetch and validate `current.json`. Read `current.id` and find this
-   hostname in `current.nodes`. A missing/empty publication or absent
-   hostname is an error; keep the existing tunnel unchanged. Do not select
-   `previous` as a fallback for a removed node.
-2. Validate the ID as exactly 52 lowercase Crockford Base32 characters
+1. Fetch `current.json`. Verify the envelope's Ed25519 signature over
+   `wg-vpn/current.json/v2\n` followed by the decoded payload bytes,
+   against each of `server_verify_keys`. Only then parse and validate the
+   payload (wg-server.md §10). A signature that verifies under none of
+   them, or an unsupported schema version (v1 included), is an error;
+   keep the existing tunnel unchanged.
+2. **Replay check.** Compare the payload's `sequence` with the highest
+   one recorded in the state file, using integers only, never the local
+   clock:
+   - **lower:** reject it as a replayed pointer and report it as a
+     possible bucket compromise;
+   - **equal, but a different payload digest from the one recorded:**
+     reject it as an integrity error, since two different signed
+     pointers share a sequence;
+   - **higher:** record the new sequence and payload digest durably
+     before downloading anything.
+
+   Without a state file (first install), accept any correctly signed
+   pointer (wg-server.md §12). The recorded high-water mark only ever
+   moves up, even on passes that end as no-ops or fail later, because
+   the pointer itself was authentic.
+3. Read `current.id` and find this hostname in `current.nodes`. A
+   missing/empty publication or absent hostname is an error; keep the
+   existing tunnel unchanged. Do not select `previous` as a fallback for
+   a removed node. If the entry's `recipient` fingerprint matches none of
+   this node's `age_identities`, report "published for a different
+   identity" and keep the tunnel. That usually means the topology's
+   `age_recipient` and the node's config are out of step.
+4. Validate the ID as exactly 52 lowercase Crockford Base32 characters
    matching `^[01][0-9abcdefghjkmnpqrstvwxyz]{51}$`. It encodes 32 random
    bytes, using the canonical encoding defined by the server. Construct
-   `nodes/{hostname}/{current.id}.conf`; never follow an arbitrary
+   `nodes/{hostname}/{current.id}.conf.age`; never follow an arbitrary
    URL or path from downloaded metadata.
-3. Enforce the shared limits: 16 MiB for discovery JSON, 4096 nodes, and
-   1 MiB per configuration, regardless of `Content-Length`. Each is an
+5. Enforce the shared limits: 16 MiB for discovery JSON, 4096 nodes,
+   1 MiB + 64 KiB per downloaded ciphertext, and 1 MiB per decrypted
+   configuration, regardless of `Content-Length`. Each is an
    inclusive maximum (see [wg-server.md §6](./wg-server.md#6-hostname--topology-validation)) —
    reject only the first byte/node past it, not an exactly-at-limit value.
    Download the entire file with a finite deadline. Compute
    SHA-256 over its exact bytes and encode the 32-byte digest using the
    same 52-character lowercase Crockford Base32 format. Compare it with
-   `current.nodes[hostname]`, then validate the configuration before making
-   any local change. All persisted or logged application digests use this
+   `current.nodes[hostname].digest`. Then decrypt in memory with this
+   node's `age_identities`:
+   - reject a header with any stanza type other than `mlkem768x25519` or
+     a stanza count other than two;
+   - cap the output at 1 MiB;
+   - never write plaintext anywhere before decryption fully succeeds,
+     including authentication of the final chunk.
+
+   Finally validate the plaintext configuration before making any local
+   change. A digest mismatch or decryption failure is an integrity error,
+   not a cue to rediscover. All persisted or logged application digests use this
    encoding too; storage ETags remain opaque and WireGuard keys use Base64.
-4. If the generation object returns 404, reread `current.json`. If current
+6. If the generation object returns 404, reread `current.json`. If current
    has changed, restart discovery against the new generation; cleanup may
    have removed the earlier one. If it is unchanged, report a missing
    referenced object as an integrity error. Limit a sync pass to three
@@ -232,7 +294,7 @@ failure for this pass; never broaden credentials just to improve diagnostics
 
 For example, `current.id = "189c8r7s5x4dcvhq7acet5dr0zpc592e13rxd8xgk3nqe1hxj9d4"` and hostname
 `workstation-01` resolve to
-`nodes/workstation-01/189c8r7s5x4dcvhq7acet5dr0zpc592e13rxd8xgk3nqe1hxj9d4.conf`.
+`nodes/workstation-01/189c8r7s5x4dcvhq7acet5dr0zpc592e13rxd8xgk3nqe1hxj9d4.conf.age`.
 The client never lists generations or infers their order from IDs or its
 clock. A fully downloaded, verified file remains usable if its generation
 is later removed from storage; publication and local application are
@@ -292,8 +354,9 @@ sequenceDiagram
         C->>W: bring up from last-good local conf_path (no network call)
     end
     C->>S: GetObject current.json
-    C->>S: GetObject nodes/{hostname}/{current.id}.conf
-    Note over C,S: Verify digest, on a retired generation's 404,<br/>rediscover current with a bounded retry budget
+    C->>C: verify signature, reject replayed sequence,<br/>record new high-water mark
+    C->>S: GetObject nodes/{hostname}/{current.id}.conf.age
+    Note over C,S: Verify digest, decrypt with own age identity,<br/>on a retired generation's 404, rediscover current<br/>with a bounded retry budget
     alt discovery or download failed
         C->>C: log error, exit non-zero
         Note over C,W: existing interface, if any, is left untouched
@@ -337,7 +400,12 @@ file. Check that the device is WireGuard and that managed settings match;
 mere existence under `/sys/class/net` is insufficient.
 
 Record the owning hostname/interface, last applied generation and digest,
-and any pending transaction's prior state/backup digest in the state file.
+the highest verified pointer `sequence` with its payload digest (step 2
+above), and any pending transaction's prior state/backup digest in the
+state file. Applied digests refer to the **plaintext** installed at
+`conf_path`. Ciphertext digests change with every encryption and are only
+compared against the pointer. Losing the state file loses replay
+protection until the next pass re-records it.
 Reject an unexpected local identity change and a non-WireGuard device
 using the requested interface name. A pre-existing untracked config can
 be adopted only after validation and comparison with its running managed
@@ -436,7 +504,8 @@ Key properties this preserves:
 - **Attempt local rollback on apply failure.** Preserve a last good local
   configuration when one exists and report whether recovery succeeded.
 - **No unnecessary flaps.** A new fleet generation may contain exactly the
-  same bytes for this node. Compare configuration content and applied state,
+  same plaintext for this node (its ciphertext always differs). Compare
+  decrypted configuration content and applied state,
   not generation IDs alone, when deciding whether to reapply.
 
 The interface name used for every netlink/UAPI call is the validated stem
@@ -655,7 +724,10 @@ host's resolver setup.
 | Credentials invalid/expired | Fail the pass; reload atomically renewed credentials on the next pass. Distinguish ambiguous configuration 403s as specified in §6. |
 | No current generation or hostname absent from current | Report no publication/not registered; keep local state, never fetch previous as an automatic fallback. |
 | Referenced config missing after retention cleanup | Rediscover current within the three-round budget. An unchanged pointer with a missing referenced file is an integrity error. |
-| Digest mismatch or invalid config | Reject before installation; existing tunnel untouched. |
+| Pointer signature fails, or unsupported schema version (including v1 before migration) | Reject before any download; existing tunnel untouched. |
+| Pointer `sequence` lower than recorded, or equal with a different payload | Reject as replay/equivocation and report a possible bucket compromise; existing tunnel untouched. |
+| Published recipient fingerprint matches none of this node's identities | Report "published for a different identity"; existing tunnel untouched. |
+| Digest mismatch, decryption failure, disallowed stanza type/count, or invalid config | Reject before installation; existing tunnel untouched. |
 | Teardown, installation, startup, or local health check fails | Stop candidate application; attempt local recovery when a last good config exists. Report both outcomes and return nonzero. |
 | First installation fails with no backup | Clean up candidate state, report failure; do not claim rollback succeeded. |
 | Process crashes during apply | Recover durable pending state on the next invocation before any hash-based no-op. |
@@ -671,7 +743,16 @@ host's resolver setup.
   session token for temporary credentials and renew them out of band.
   Never distribute a parent token that could mint broader permissions.
   Secret-bearing configuration must not be baked into shared/public images.
-- The downloaded `.conf` at `conf_path` contains this node's private key
+- `age_identities` can decrypt every file ever published to this node,
+  including retained generations. Protect the client config like the
+  WireGuard private key it unlocks, and never bake it into a shared
+  image. A leaked identity calls for both an identity rotation and
+  `--rotate` of this node (wg-server.md §8).
+- `server_verify_keys` is the node's trust anchor for everything it
+  applies. An attacker who can edit it can make the node accept their
+  configurations, so it needs the same root-owned, no-untrusted-write
+  protection as the binary itself. It is not secret.
+- The decrypted `.conf` at `conf_path` contains this node's private key
   and the preshared keys for its peers. `wg-client` sets `0600` /
   root-owned permissions explicitly on write, rather than relying on any
   external tool's file-permission defaults — there is no `wg-quick`
@@ -681,10 +762,11 @@ host's resolver setup.
   untrusted writes. Reject symlinks and non-regular files; use exclusive
   creation and directory-relative, no-follow operations to prevent races.
   Keep one backup only, and fsync files/directories as described in §6.
-- Validate the config even when its digest is correct. Digests authenticate
-  bytes relative to the pointer, not against a compromised bucket writer.
-  The directive allowlist prevents downloaded hooks from becoming root
-  shell commands; a writer can still change trusted VPN identities/routes.
+- Validate the config even when its digest and signature are correct.
+  With the pointer signed, the digest authenticates the file against a
+  bucket writer. Holders of the server's signing key can still publish
+  anything, and the directive allowlist then still prevents downloaded
+  hooks from becoming root shell commands.
 - Validate `r2_config.endpoint` in application code
   (`wg_common::topology::validate_r2_endpoint`): reject a non-`http`/
   `https` scheme, URL userinfo, query strings, and fragments; reject
@@ -693,8 +775,8 @@ host's resolver setup.
   are not yet implemented — `docker-tests/` deliberately uses plain HTTP
   against local MinIO (CLAUDE.md "Known simplifications"). Keep
   discovery/config downloads on the configured authenticated endpoint.
-- Redact private keys, PSKs, credentials, request signing headers, complete
-  configs, and secret kernel fields from logs, parser diagnostics, and any
+- Redact private keys, PSKs, age identities, credentials, request signing
+  headers, complete plaintext and ciphertext configs, and secret kernel fields from logs, parser diagnostics, and any
   DNS-integration subprocess output. Log sanitized field names and
   outcomes; never dump a raw device/peer configuration (private keys and
   PSKs included) into logs, whether read back via the `wireguard-control`
@@ -711,7 +793,9 @@ host's resolver setup.
 | `aws-sdk-s3`, `aws-config` | S3-compatible storage client (GetObject only) |
 | `hostname` | System hostname lookup |
 | `fd-lock` (or `fs2`) | `flock`-based single-instance guard |
-| `sha2` | SHA-256 digest computation over downloaded configuration bytes, compared against `current.json`'s published digest and the locally persisted applied-hash state (§6) |
+| `sha2` | SHA-256 digest computation over downloaded ciphertext (compared against the signed pointer), decrypted plaintext (compared against the persisted applied hash), and recipient fingerprints (§6) |
+| `age` (+ `wg-common`'s `mlkem768x25519` type) | Decrypting the node's configuration with its own identity (wg-server.md §10) |
+| `ed25519-dalek` | Verifying the pointer signature against `server_verify_keys` |
 | `ipnet` | CIDR overlap checks against the live routing table during preflight (§6) — a client-specific use, separate from `wg-common`'s config-parsing use below |
 | `wireguard-control` (or equivalent netlink/UAPI crate) | In-process WireGuard device creation/configuration (private key, listen port, peers, `AllowedIPs`, keepalive) and interface address/route management via netlink — the same approach [innernet](https://github.com/tonarino/innernet) uses; replaces shelling out to `wg`/`wg-quick` (§6, §8) |
 | `wg-common` (shared crate, §3) | Strict config parser/validator, key validation, shared limits, and the canonical lowercase Crockford Base32 encoding for IDs/digests — the same implementation `wg-server` uses, so neither binary reimplements it independently |

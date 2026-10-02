@@ -2,6 +2,15 @@
 
 Status: design only, no implementation yet.
 
+> **Encrypted, signed publication (discovery schema v2) is designed but
+> not implemented yet.** Sections that describe per-node age encryption,
+> the signed `current.json` envelope, `publication_keys`,
+> `nodes[].age_recipient`, `keygen`, and `restore-previous` (§4–§5, §8,
+> §10–§12) are the target design. The current code still implements
+> schema v1: plaintext `.conf` objects and an unsigned pointer. See
+> [§10 "Encryption and signing"](#encryption-and-signing-schema-v2) and
+> "Migrating from schema v1" for the plan.
+
 ## 1. Purpose
 
 `wg-server` is a control-plane CLI tool run by an ephemeral cloud cron job
@@ -19,9 +28,13 @@ The storage bucket holds all durable publication state. The tool:
    `wg-quick`; it parses the file and pushes the result to the kernel
    directly over netlink/UAPI (see
    [wg-client.md §1](./wg-client.md#1-purpose)).
-4. Uploads a complete immutable generation to an S3-compatible bucket
-   (Cloudflare R2 in the reference deployment), then publishes it through
-   `current.json` (§10). Independent `wg-client` jobs pull the latest
+4. Encrypts each node's file to that node's own post-quantum hybrid age
+   recipient (plus the server's own recipient, so later runs can reuse
+   keys), uploads a complete immutable generation to an S3-compatible
+   bucket (Cloudflare R2 in the reference deployment), then publishes it
+   through a signed `current.json` (§10). The bucket holds only
+   ciphertext and signed metadata, never plaintext key material.
+   Independent `wg-client` jobs pull the latest
    generation **daily at 00:30** (see
    [docs/wg-client.md](./wg-client.md)).
 
@@ -78,8 +91,10 @@ wg-vpn/
 ## 4. CLI
 
 ```
-wg-server apply    --config <path> [--rotate [<hostname>]]... [--dry-run] [--prune]
+wg-server apply    --config <path> [--rotate [<hostname>]]... [--dry-run] [--prune] [--migrate-v1]
 wg-server validate --config <path>
+wg-server keygen
+wg-server restore-previous --config <path> [--dry-run]
 ```
 
 | Flag | Default | Meaning |
@@ -89,7 +104,28 @@ wg-server validate --config <path>
 | `--dry-run` | off | Read published state and compute the plan (key reuse/rotation, generation publication, retention cleanup); print a summary without secrets. Perform no bucket writes or deletes. |
 | `--prune` | off | Skip the retention grace period (§10) and delete anything outside `current`/`previous` immediately, instead of waiting the usual ~15 minutes. Automatically implied by `--rotate` in either form — see below. |
 
-`validate` only runs schema + topology validation (§5–6), no key handling, no network calls.
+| `--migrate-v1` | off | One-time upgrade from an unsigned schema v1 pointer with plaintext `.conf` generations to schema v2 (§10 "Migrating from schema v1"). Without it, `apply` refuses a v1 pointer. Implies `--prune`. |
+
+`validate` only runs schema + topology validation (§5–6), including
+parsing `publication_keys` and every `age_recipient`, with no network calls.
+
+`keygen` makes no network call and reads no config. It generates a fresh
+server age identity (`mlkem768x25519`) and a fresh Ed25519 signing key,
+and prints one JSON object to stdout. The object holds the
+`publication_keys` block for this config (§5), plus the derived
+`server_recipient` and `server_verify_key` for operators to distribute.
+`server_verify_key` goes into every client's `server_verify_keys` (see
+[wg-client.md §4](./wg-client.md#4-client-configuration-schema)). Run it
+with a restrictive umask and redirect stdout straight into the secret
+store; it never writes a file itself.
+
+`restore-previous` is the signed replacement for hand-editing the pointer
+during recovery (§11). It verifies the current pointer's signature,
+decrypts and validates every file of the retained `previous` generation,
+and then conditionally writes a new signed pointer:
+`current` = the old `previous`, `previous: null`, a fresh `revision`, and
+a new `sequence` (§10). `--dry-run` reports what it would restore without
+writing.
 
 The normal server command is `wg-server apply --config <path>`, on cloud
 cron expression `0 0 * * *` in UTC.
@@ -119,9 +155,15 @@ same one-generation retention policy.
     "region": "auto",
     "bucket": "wg-confs"
   },
+  "publication_keys": {
+    "age_identity": "AGE-SECRET-KEY-PQ-1...",
+    "retired_age_identities": [],
+    "signing_key": "<Base64 32-byte Ed25519 seed>"
+  },
   "nodes": [
     {
       "hostname": "master-us",
+      "age_recipient": "age1pq1...",
       "wg_config": {
         "tunnel_address": "10.10.0.1/32",
         "listen_port": 51820,
@@ -134,6 +176,7 @@ same one-generation retention policy.
     },
     {
       "hostname": "master-eu",
+      "age_recipient": "age1pq1...",
       "wg_config": {
         "tunnel_address": "10.10.0.2/32",
         "listen_port": 51820,
@@ -142,6 +185,7 @@ same one-generation retention policy.
     },
     {
       "hostname": "workstation-01",
+      "age_recipient": "age1pq1...",
       "wg_config": {
         "tunnel_address": "10.10.0.100/32",
         "persistent_keepalive": 25
@@ -157,7 +201,8 @@ same one-generation retention policy.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `r2_config` | object | yes | Storage credentials — see below. |
-| `nodes` | array | yes | See below. |
+| `publication_keys` | object | yes | Server age identity and pointer-signing key — see below. |
+| `nodes` | array | yes | See below. Each entry has `hostname`, `age_recipient`, and `wg_config`. |
 | `master` | string[] | yes | Hostnames of master nodes — see below. |
 
 ### `r2_config`
@@ -170,6 +215,23 @@ same one-generation retention policy.
 | `session_token` | string | no | Required when the supplied access-key pair represents temporary credentials. Load fresh credentials for every cron invocation. |
 | `region` | string | yes | `"auto"` for R2; a real region for AWS S3/other providers. |
 | `bucket` | string | yes | Bucket containing `current.json` and `nodes/` (§10). Reserve these names exclusively for this fleet. |
+
+### `publication_keys`
+
+All three values are secrets. Supply them the same way as the read-write
+credentials (§12). `wg-server keygen` (§4) generates them.
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `age_identity` | string | yes | The server's own age identity: `AGE-SECRET-KEY-PQ-1…` (the `mlkem768x25519` type, §10). Every published file is also encrypted to its recipient, so the next `apply` can decrypt the current generation and reuse its keys (§8). |
+| `retired_age_identities` | string[] | no (default `[]`) | Earlier server identities. Used **only to decrypt** the current generation while the server identity is being rotated; never used to encrypt. At most 2 entries. Remove an entry once a run under the new identity has committed. |
+| `signing_key` | string | yes | Canonical Base64 of a 32-byte Ed25519 secret seed. Signs every `current.json` write (§10). Its public key is what clients pin as `server_verify_keys`. |
+
+### `nodes[].age_recipient`
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `age_recipient` | string | yes | This node's age recipient, `age1pq1…` (`mlkem768x25519` only). Each node generates its own identity locally (`wg-client keygen`, [wg-client.md §3](./wg-client.md#3-cli)); only this public half is ever given to the server. |
 
 ### `nodes[].wg_config`
 
@@ -200,6 +262,16 @@ Run for both `apply` and `validate`, before any key handling or network call:
   never concatenate raw operator text as config directives.
 - Hostname must match `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$` (DNS-label-safe,
   and safe as an S3 key / filename).
+- Every `age_recipient` must parse as a canonical `mlkem768x25519`
+  recipient (`age1pq1…`). Reject every other recipient type, including
+  classic X25519 `age1…`, SSH, and plugin recipients. age says a file
+  SHOULD NOT mix post-quantum and non-post-quantum recipients (§10), and
+  this fleet allows only the hybrid type. Reject duplicate recipients
+  across nodes, since a shared identity would let one node decrypt
+  another's file. Also reject any node recipient equal to the server's own.
+- `publication_keys.age_identity` and each `retired_age_identities` entry
+  must parse as `mlkem768x25519` identities with distinct recipients.
+  `signing_key` must decode as canonical Base64 to exactly 32 bytes.
 - Hostnames must be unique across `nodes`.
 - `nodes` must be non-empty.
 - Every entry in `master` must reference an existing hostname in `nodes`,
@@ -295,14 +367,21 @@ every node's local LAN or changing DNS answers.
 ## 8. Key management
 
 `wg-server` keeps no local database or key store between runs. On every
-run it reads `current.json`, then obtains reusable keys from the complete
-generation named by `current`. The pointer and retained `.conf` objects
-are the only durable state; an interrupted job's memory or temporary
-files are never needed for recovery.
+run it reads `current.json` and verifies its signature against its own
+`signing_key` (§10). It then gets reusable keys by decrypting the
+complete generation named by `current` with its own age identity (or a
+retired one, §5). The signed pointer and retained `.conf.age` objects are
+the only durable state; an interrupted job's memory or temporary files are
+never needed for recovery. The `publication_keys` secrets come from the
+job's secret store on every run, the same as the storage credentials, so
+they add no local state either.
 
 A hostname absent from the current generation is a new node. An object
-listed in that generation that is missing, corrupt, or unparsable is a
-state-integrity error, not permission to silently generate a new identity.
+listed in that generation that is missing, corrupt, undecryptable, or
+unparsable is a state-integrity error, not permission to silently generate
+a new identity. A pointer whose signature does not verify is also an
+integrity error, as is one with an unsupported schema version (except a
+v1 pointer under `--migrate-v1`, §10).
 Abort and report the affected node. Only a new node or an explicit
 `--rotate` request gets freshly generated identity keys.
 
@@ -310,9 +389,16 @@ Abort and report the affected node. Only a new node or an explicit
 
 | Key | Algorithm | Scope | Source |
 |---|---|---|---|
-| Private key | X25519 scalar generated from 32 CSPRNG bytes and clamped as required by WireGuard, Base64 | one per **node** | reused from the node's `.conf` in the current generation if registered and not rotating; otherwise freshly generated |
+| Private key | X25519 scalar generated from 32 CSPRNG bytes and clamped as required by WireGuard, Base64 | one per **node** | reused from the node's decrypted `.conf.age` in the current generation if registered and not rotating; otherwise freshly generated |
 | Public key | derived from private key | one per **node** | recomputed from whichever private key was used (reused or fresh) |
 | Preshared key | 32 CSPRNG bytes, Base64 | one per **edge** (unordered pair) | reused from both endpoints' matching current stanzas if neither endpoint is rotating; otherwise generated once per edge |
+| Node age identity | `mlkem768x25519` (ML-KEM-768 + X25519 hybrid) | one per **node** | generated **on the node** (`wg-client keygen`); the server only ever sees its recipient (`nodes[].age_recipient`) and never generates, stores, or publishes it |
+| Server age identity | `mlkem768x25519` | one per **fleet** | `publication_keys.age_identity`, generated by `wg-server keygen` and supplied as a job secret |
+| Pointer signing key | Ed25519 | one per **fleet** | `publication_keys.signing_key`, generated by `wg-server keygen` and supplied as a job secret |
+
+The age and signing keys are long-lived configuration, not per-run key
+material. `--rotate` never touches them; rotating them is the staged,
+operator-driven procedure in "Rotating publication keys" below.
 
 Preshared keys are symmetric in usage (the same value is written into both
 endpoints' `PresharedKey =` line), but there is nothing to derive — the
@@ -356,30 +442,85 @@ state to consult beyond the bucket contents `wg-server` already has to read
 for the skip-if-unchanged upload check (§10) — reading existing objects
 back serves both purposes in the same pass.
 
+### Rotating publication keys
+
+None of these steps require fleet downtime. Each is a sequence of normal
+`apply` runs plus out-of-band config pushes.
+
+- **A node's age identity** (e.g. the node was reimaged, or its identity
+  file leaked):
+  1. Generate a new identity on the node.
+  2. Add it to the node's `age_identities` *alongside* the old one
+     ([wg-client.md §4](./wg-client.md#4-client-configuration-schema)).
+  3. Replace that node's `age_recipient` in the topology and run `apply`.
+     The recipient fingerprint changes (§10), so this publishes a new
+     generation even when nothing else changed.
+  4. Once the node has applied it, remove the old identity from the
+     node's config.
+
+  If the old identity leaked, also `--rotate` that node. Its WireGuard
+  private key and PSKs were readable to whoever held the old identity.
+- **The server age identity**:
+  1. Move the old value into `retired_age_identities`, put a fresh one in
+     `age_identity`, and run `apply`. Recipient sets change, so the run
+     re-encrypts every file to the new server recipient.
+  2. After that commit, drop the retired entry.
+
+  The retired identity also stays able to decrypt the retained
+  `previous` generation, which still names the old recipient. Removing it
+  is what retires that copy from the server's view; the objects
+  themselves go at the next cleanup that drops them.
+- **The signing key**:
+  1. Add the new verify key to every client's `server_verify_keys` and
+     wait until all clients have it.
+  2. Switch `signing_key` to the new value and run `apply`. Rotating the
+     signing key forces a pointer write but not a new generation.
+  3. Remove the old verify key from clients.
+
+  Changing the signing key before every client trusts the new verify key
+  leaves those clients rejecting every pointer until they do. They fail
+  closed: their tunnel stays up.
+- **Loss of the server age identity** with no retired copy means the
+  current generation can't be decrypted, so its keys can't be reused.
+  Recover with bare `--rotate`, which rekeys the whole fleet. The
+  integrity pass that normally decrypts existing records first (§8 above)
+  is skipped only in this case, and the run reports it explicitly as
+  `reuse=unavailable-rotating-all`.
+
 ### `apply` algorithm
 
 1. Validate input and rotation targets before any network call. Compute
    the desired node set and edge set (§7).
-2. Fetch and validate `current.json`, retaining its ETag for conditional
-   publication. Initialize an empty pointer for a new fleet as described
-   in §10; never infer published state from orphan uploads. A dry run only
-   plans initialization.
+2. Fetch `current.json`, retaining its ETag for conditional publication.
+   Verify its signature and validate its payload (§10). Initialize an
+   empty signed pointer for a new fleet as described in §10; never infer
+   published state from orphan uploads. A dry run only plans
+   initialization.
 3. Fetch the current generation's files for desired nodes already listed
-   there, with bounded parallelism. Verify their SHA-256 digests before
-   parsing keys. Nodes not listed there have no reusable current identity.
+   there, with bounded parallelism. Verify their SHA-256 digests (over the
+   ciphertext), decrypt them with the server identity, and only then parse
+   keys. Nodes not listed there have no reusable current identity.
 4. Resolve node keypairs and edge preshared keys using the rules above.
-5. Render every desired node's complete configuration (§9). Compare both
-   the desired hostname set and configuration bytes with the current
-   generation. If all match, keep the current/previous generation entries
-   unchanged and proceed to the conditional revision refresh and retention
-   cleanup in §10. No new generation is created.
-6. Otherwise, generate a unique generation ID and upload **every** desired
-   node's configuration under it, including files unchanged from the
-   previous generation. Each generation is self-contained; it never
-   depends on files belonging to an older generation.
+5. Render every desired node's complete plaintext configuration (§9).
+   age ciphertext is randomized, so compare plaintext, never ciphertext.
+   A node is unchanged only when all of these match the current generation:
+   - its decrypted plaintext bytes;
+   - its recipient fingerprint (§10);
+   - the server recipient its file was encrypted to.
+
+   If the desired hostname set and every node match, keep the
+   current/previous generation entries unchanged and proceed to the
+   conditional revision refresh and retention cleanup in §10. No new
+   generation is created.
+6. Otherwise, generate a unique generation ID. Encrypt **every** desired
+   node's configuration to exactly two recipients — that node's
+   `age_recipient` and the server's own — and upload each under the new
+   ID, including nodes whose plaintext didn't change. Each generation is
+   self-contained; it never depends on files belonging to an older
+   generation.
 7. After every upload succeeds, conditionally replace `current.json` with
-   the new generation as `current` and the former `current` as `previous`
-   (§10). On failure, leave the published pointer untouched or reconcile
+   a newly signed pointer naming the new generation as `current` and the
+   former `current` as `previous` (§10). On failure, leave the published pointer untouched or reconcile
    an uncertain result before doing any cleanup.
 8. Automatically remove generations outside `current` and `previous`,
    including abandoned uploads from terminated jobs (§10). This also runs
@@ -394,7 +535,8 @@ this repo executes it through `wg-quick`; `wg-client` parses it with
 [wg-client.md §1](./wg-client.md#1-purpose) and
 [§6](./wg-client.md#6-sync-algorithm)). It stays `wg-quick`-compatible
 syntax anyway: it's a well-understood, human-readable INI format, and
-keeping it lets an operator inspect a downloaded `.conf` with any
+keeping it lets an operator inspect a downloaded file — once decrypted
+with the node's or server's identity, e.g. Go `age -d` — with any
 existing WireGuard tooling if they ever need to.
 
 Peers are emitted in sorted hostname order for stable, diff-friendly
@@ -462,6 +604,11 @@ Notes:
 - Emit only the directive subset accepted by wg-client §6. Never generate
   `PreUp`, `PostUp`, `PreDown`, `PostDown`, `SaveConfig`, or arbitrary shell
   text. Validate every rendered file with the shared parser before upload.
+- This plaintext is what gets encrypted (§10); it never reaches the
+  bucket unencrypted. The 1 MiB per-file limit (§6) applies to this
+  plaintext. Self-validation runs on the plaintext before encryption. As
+  an extra check, the server decrypts each ciphertext it produced with its
+  own identity and compares the result byte-for-byte before uploading.
 
 ## 10. Upload to storage
 
@@ -471,35 +618,65 @@ The configured bucket has two reserved names:
 
 ```text
 current.json
-nodes/<hostname>/<generation-id>.conf
+nodes/<hostname>/<generation-id>.conf.age
 ```
 
 `current.json` is the fixed discovery object fetched by both the server
-and every client. It contains the current generation and at most one
-previous committed generation. Each entry includes the complete hostname
-set and each configuration's SHA-256 digest. For example:
+and every client. It is a signed envelope (see "Encryption and signing"
+below) around a payload. The payload contains the current generation and
+at most one previous committed generation. Each generation entry contains:
+- the complete hostname set;
+- for each node, the SHA-256 digest of its uploaded ciphertext and the
+  fingerprint of the recipient that file was encrypted to;
+- the fingerprint of the server recipient used for that generation.
+
+The stored object:
 
 ```json
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "payload": "<canonical Base64 of the exact payload JSON bytes>",
+  "signature": "<canonical Base64 of a 64-byte Ed25519 signature>"
+}
+```
+
+with a decoded payload such as:
+
+```json
+{
+  "schema_version": 2,
+  "sequence": 1790812800123,
   "revision": "0eadndcbb7ved8xd0x34e6229z4ecbhqd5nmr6krre4bk4kp32xm",
   "current": {
     "id": "189c8r7s5x4dcvhq7acet5dr0zpc592e13rxd8xgk3nqe1hxj9d4",
+    "server_recipient": "1d0k7ckr5pwsg4ab3nvkfh2c3y8a91yq2g1wq4nqk4m7ezm5bfa0",
     "nodes": {
-      "master-us": "17670h05q0z785jbt19b4vsyqrggq6rkna7s21764kzas2p5dgs2",
-      "workstation-01": "0m205js6jn658mf9j5y9k9wee9yvgv14bsdmt4ne8k2nexyx10j1"
+      "master-us": {
+        "digest": "17670h05q0z785jbt19b4vsyqrggq6rkna7s21764kzas2p5dgs2",
+        "recipient": "0w2k6q5d7xk1s9d1c4e5nm0cg9ah1x8w3c1rzm6k3t7de8v2yy0s"
+      },
+      "workstation-01": {
+        "digest": "0m205js6jn658mf9j5y9k9wee9yvgv14bsdmt4ne8k2nexyx10j1",
+        "recipient": "1ac4f5r2y9v6mx0t8s3hq4e7nm2b5kd1c7a4w9zg3pj6r8t0e2mn"
+      }
     }
   },
   "previous": {
     "id": "0j530zh3377p9035zg0jbex7hpf30g8zmt476nwxr0g41kjs31nf",
+    "server_recipient": "1d0k7ckr5pwsg4ab3nvkfh2c3y8a91yq2g1wq4nqk4m7ezm5bfa0",
     "nodes": {
-      "master-us": "0eadndcbb7ved8xd0x34e6229z4ecbhqd5nmr6krre4bk4kp32xm"
+      "master-us": {
+        "digest": "0eadndcbb7ved8xd0x34e6229z4ecbhqd5nmr6krre4bk4kp32xm",
+        "recipient": "0w2k6q5d7xk1s9d1c4e5nm0cg9ah1x8w3c1rzm6k3t7de8v2yy0s"
+      }
     }
   }
 }
 ```
 
-The IDs and digests above are illustrative. Generate each ID from **32
+The IDs, digests, and fingerprints above are illustrative. A recipient
+fingerprint is SHA-256 over the canonical recipient string's ASCII bytes
+(`age1pq1…`), in the encoding below. Generate each ID from **32
 CSPRNG bytes**. Compute each configuration digest using **SHA-256 over the
 exact uploaded bytes**, yielding 32 digest bytes. Both use the same text
 encoding: interpret the bytes as an unsigned big-endian 256-bit integer,
@@ -526,8 +703,8 @@ that pin its output against known values derived from this specification
 (see [milestones.md](./milestones.md)) rather than trusting a generic crate.
 
 Use this encoding for **all application-defined digests**, including
-publication metadata, logged hashes, and clients' persisted applied
-hashes. Hash computation remains deterministic; generation IDs and pointer
+publication metadata, recipient fingerprints, logged hashes, and clients'
+persisted applied hashes. Hash computation remains deterministic; generation IDs and pointer
 revisions are random. Storage ETags are opaque provider values and must be passed back
 unchanged, and WireGuard keys retain their required Base64 format. IDs
 contain no timestamp and must never be sorted to discover the latest
@@ -540,12 +717,26 @@ It fences delayed conditional writes from earlier invocations without
 creating another configuration generation. Clients use `current.id` for
 discovery; a revision-only update does not trigger local application.
 
+`sequence` is a nonnegative JSON integer no larger than `2^53 − 1`. Every
+pointer write sets it to `max(old.sequence + 1, now_unix_millis)`, where
+initialization uses `now_unix_millis` alone. That covers publication,
+revision refresh, initialization, migration, and `restore-previous`. It is
+strictly increasing across writes, so clients can reject a replayed older
+pointer (see [wg-client.md §6](./wg-client.md#6-sync-algorithm)). The
+wall-clock term lets the sequence recover past any value a client has
+seen even if an attacker rolled the stored pointer back. The `+ 1` term
+keeps it increasing if the server's clock steps backward. Clients never
+compare `sequence` with their own clock.
+
 Node names follow §6. Reject unknown fields, unsupported schema versions,
-duplicate JSON keys, malformed entries, and equal current/previous IDs.
-Each non-null generation contains a nonempty hostname-to-digest map within
-the shared limits; `current: null` requires `previous: null`. Derive object
-paths from these validated values; the discovery object supplies no
-arbitrary URL or filesystem path.
+duplicate JSON keys, malformed entries, and equal current/previous IDs, in
+both the envelope and the payload. The two `schema_version` values must
+match. Each non-null generation contains a valid `server_recipient`
+fingerprint and a nonempty hostname map within the shared limits. Each
+map entry has exactly a `digest` and a `recipient` fingerprint.
+`current: null` requires `previous: null`. Derive object paths from these
+validated values; the discovery object supplies no arbitrary URL or
+filesystem path. Parse the payload only after its signature verifies.
 
 `previous` is `null` until a second generation is committed. Before the
 first publication, both `current` and `previous` may be `null`; clients
@@ -559,19 +750,121 @@ lost or inconsistent state and require explicit recovery. Initializing
 the pointer before staging files lets the next
 cron job recognize an interrupted first publication.
 
-A client named `workstation-01` reads `current.json`, selects `current`,
-looks up its digest, and downloads
-`nodes/workstation-01/189c8r7s5x4dcvhq7acet5dr0zpc592e13rxd8xgk3nqe1hxj9d4.conf` in this
-example. It verifies the digest before local application. It needs no
-bucket listing, synchronized clock, server notification, or remembered
+A client named `workstation-01` reads `current.json` and verifies its
+signature. It selects `current`, looks up its own entry, and downloads
+`nodes/workstation-01/189c8r7s5x4dcvhq7acet5dr0zpc592e13rxd8xgk3nqe1hxj9d4.conf.age` in this
+example. It verifies the digest, decrypts the file with its own age
+identity, and validates the plaintext before local application. It needs
+no bucket listing, synchronized clock, server notification, or remembered
 remote generation ID. See [wg-client.md §6](./wg-client.md#6-sync-algorithm).
 
-Configuration objects use `Content-Type: text/plain; charset=utf-8`; the
+Configuration objects use `Content-Type: application/octet-stream`; the
 pointer uses `Content-Type: application/json`. Set `Cache-Control: no-store`
 on both and use the authenticated storage endpoint directly. Each new
 generation includes every node's full file, even if only one file changed.
 An entirely unchanged topology and rendered content leave both retained
 generation entries unchanged; the revision may refresh to fence cleanup.
+
+### Encryption and signing (schema v2)
+
+**Configuration files** are [age v1](https://age-encryption.org/v1)
+files in the binary format (not ASCII armor). Each file has exactly two
+recipient stanzas, both of the native hybrid post-quantum type
+`mlkem768x25519`: one for the node's `age_recipient` and one for the
+server's own recipient. That type combines ML-KEM-768 and X25519 through
+HPKE ([C2SP age spec](https://github.com/C2SP/C2SP/blob/main/age.md);
+recipients `age1pq1…`, identities `AGE-SECRET-KEY-PQ-1…`). An attacker has
+to break both ML-KEM-768 and X25519 to read a file. The WireGuard PSKs
+inside are 32 random bytes, so recorded tunnel traffic stays protected
+against a future quantum attacker as long as this delivery path is too.
+age says a file SHOULD NOT mix this type with non-post-quantum
+recipients, and this fleet makes that a hard rule.
+
+- Both readers reject a file whose header contains any stanza type other
+  than `mlkem768x25519`, or a stanza count other than two. This stops a
+  writer from downgrading a file to a classical-only recipient. age
+  stanzas don't reveal which recipient they're for, so readers check the
+  count and type, not the recipient's identity.
+- Bound reads on both sides. The ciphertext download limit is 1 MiB +
+  64 KiB (inclusive), which covers the age header and per-chunk tags on a
+  1 MiB plaintext. Decrypt into a buffer capped at 1 MiB (inclusive) and
+  reject the first byte past it.
+- The per-node `recipient` fingerprint and generation-level
+  `server_recipient` fingerprint in the pointer exist for two reasons:
+  - The server can detect a recipient change (§8 step 5) without
+    decrypting anything with the node's key.
+  - A client can report "published for a different identity" clearly,
+    instead of a generic decryption failure.
+
+  They are metadata, not an access control. Decryption is the access
+  control.
+
+**The pointer** is signed with Ed25519 (`publication_keys.signing_key`).
+The signature covers the ASCII domain-separation prefix
+`wg-vpn/current.json/v2\n` followed by the exact decoded payload bytes.
+Signing raw bytes avoids JSON canonicalization rules. Verification
+happens before the payload is parsed. Both the server (against its own
+key) and every client (against `server_verify_keys`) reject a pointer
+that doesn't verify. A configuration file's integrity follows from its
+SHA-256 digest in the signed payload. Files are not signed separately.
+
+Ed25519 is classical, not post-quantum. Signatures don't share the
+harvest-now-decrypt-later exposure that encryption has: a forgery must
+happen while the verify key is still trusted, not decades after
+recording. Upgrade to a hybrid Ed25519 + ML-DSA-65 signature (§15) before
+a cryptographically relevant quantum computer is a realistic threat.
+Pinning a list of verify keys, rather than one, is what makes that
+upgrade and routine signing-key rotation possible without a flag day
+(§8).
+
+**Implementation status.** The Rust `age` crate (0.12.1, the latest
+release checked) supports the age file format and the hardware-token
+`mlkem768p256tag` type. It does not yet ship the software
+`mlkem768x25519` recipient/identity. Until it does, implement that type in
+`wg-common` against the `age` crate's public `Recipient`/`Identity` traits.
+Structure it like the crate's own `tagpq` module: the same `ml-kem` and
+`hpke` building blocks, with X25519 in place of P-256, following the HPKE
+`MLKEM768-X25519` KEM the C2SP spec references.
+
+Do not treat this module as trusted until it passes both checks:
+- it decrypts files produced by the Go reference implementation
+  (`filippo.io/age`), and Go age decrypts files it produced;
+- it passes the spec's published test vectors where available.
+
+Replace it with the upstream implementation as soon as one is released.
+No other part of this design depends on which implementation is used.
+
+### Migrating from schema v1
+
+Schema v1 has an unsigned pointer and plaintext `.conf` objects. Migration
+is a single, operator-run `apply --migrate-v1`. Rollout order:
+
+1. Upgrade every client binary. Generate each node's age identity
+   (`wg-client keygen`), and give each client its `age_identities` plus
+   the `server_verify_keys` from `wg-server keygen`. Upgraded clients
+   reject the v1 pointer and leave their tunnel up, so this step is safe
+   to do gradually.
+2. Add `publication_keys` and every node's `age_recipient` to the
+   topology, then run `wg-server apply --migrate-v1`. This:
+   1. accepts the v1 pointer (only with this flag) and validates it with
+      v1 rules;
+   2. reads reusable keys from its plaintext current generation;
+   3. publishes an encrypted generation;
+   4. conditionally replaces the pointer with a signed v2 pointer, using
+      `previous: null` (a plaintext generation is never retained under
+      v2);
+   5. deletes every plaintext `.conf` object immediately (the flag
+      implies `--prune`).
+3. Later runs omit the flag. `apply` without it rejects a v1 pointer, and
+   `--migrate-v1` rejects a v2 pointer, so a stray re-run can't downgrade
+   anything.
+
+The v1 private keys and PSKs sat in plaintext in the bucket. Unless
+per-node read scoping (§12) was enforced the whole time, combine
+`--migrate-v1` with bare `--rotate` so no key that was ever stored in
+plaintext survives into v2. Clients not upgraded before step 2 reject
+the v2 pointer and keep their old tunnel. If the migration also rotated
+keys, their links to rotated peers break until they're upgraded.
 
 ### Retry policy
 
@@ -615,8 +908,9 @@ treated as failed:
 2. Await all uploads. Only after every file is confirmed stored, replace
    `current.json` using `If-Match` with the ETag read before planning.
    Set `current` to the complete new entry and `previous` to the former
-   `current` entry, with a fresh revision. All change in the same object
-   write; use the same revision and intended bytes for its retries.
+   `current` entry, with a fresh revision and a new `sequence`, and sign
+   the payload. All change in the same object write. Retries reuse the
+   same revision, sequence, and signed bytes; never re-sign for a retry.
 3. If the pointer write times out or returns a conflict, reread it. If it
    exactly matches this invocation's intended pointer, the commit succeeded.
    If it still matches the original pointer and ETag, the same conditional
@@ -656,7 +950,9 @@ all pages beneath the reserved `nodes/` prefix and delete recognized
 generation objects whose ID is neither `current.id` nor `previous.id`.
 This removes older committed generations and abandoned uploads. Never
 delete either retained generation, the pointer, or unrelated bucket keys.
-Recognize only `nodes/<valid-hostname>/<valid-generation-id>.conf`; skip
+Recognize only `nodes/<valid-hostname>/<valid-generation-id>.conf.age`
+and, as leftovers from schema v1, `nodes/<valid-hostname>/<valid-generation-id>.conf`.
+A v1 `.conf` object is never retained under v2, whatever its ID. Skip
 and report unexpected names. Compare IDs for membership in the retained
 pair, never for chronological order. When an entry is null, it contributes
 no retained ID.
@@ -719,8 +1015,9 @@ activation barrier or a zero-downtime guarantee.
 
 - Schema/topology validation errors (§6) abort before any key handling or
   network call — fail closed.
-- Invalid discovery metadata, missing referenced files, digest mismatches,
-  or unparsable current keys abort publication without incidental rotation.
+- Invalid discovery metadata, a pointer signature that fails to verify,
+  missing referenced files, digest mismatches, undecryptable files, or
+  unparsable current keys abort publication without incidental rotation.
 - An upload failure leaves the current generation published. A pointer
   write with an uncertain result is reconciled by reading `current.json`
   (§10), never by assuming the write failed and deleting its objects.
@@ -743,10 +1040,13 @@ activation barrier or a zero-downtime guarantee.
 
 For recovery from damaged published state, stop scheduled publication and
 confirm the previous job has terminated. Verify the retained previous
-snapshot's digests and configuration consistency before using it. An
-operator can conditionally restore the pointer to that verified snapshot
-with `previous: null` and a fresh revision, using trusted storage tooling,
-then correct the topology input and resume normal `apply`. Do not infer
+snapshot's digests and configuration consistency before using it.
+`wg-server restore-previous` (§4) does that check and then conditionally
+restores the pointer to the verified snapshot, with `previous: null`, a
+fresh revision, a new sequence, and a fresh signature. A hand-edited
+pointer would fail signature verification on every client, so don't
+write one with generic storage tooling. Then correct the topology input
+and resume normal `apply`. Do not infer
 trusted keys from unreferenced files or retain a damaged snapshot as the
 fallback. If neither retained snapshot is usable, explicit re-enrollment
 is required. Recovery
@@ -760,12 +1060,38 @@ is a new publication decision and still propagates on client schedules.
   The input JSON is supplied afresh on each invocation; environment-based
   secret injection belongs to the job wrapper, not implicit SDK credential
   fallback. Never commit real credentials or rendered private configs.
+  `publication_keys` gets the same treatment, with one difference: the
+  storage credentials and the publication keys are separate secrets, and
+  the publication keys are the more important pair (see the trust
+  boundary below).
+- **Trust boundary (schema v2).** Bucket access is no longer the fleet's
+  trust boundary; `publication_keys` is. Concretely:
+  - **Read access** to the bucket reveals hostnames, digests, recipient
+    fingerprints, generation IDs, and ciphertext — no private key or PSK.
+  - **Write access** without the signing key can delete objects or upload
+    junk (denial of service). It cannot plant a configuration any client
+    or the server will accept: a forged or edited pointer fails signature
+    verification, and a file swapped under a valid pointer fails its
+    signed digest.
+  - It also cannot replay an older genuine pointer to a client that has
+    already seen a newer one (wg-client §6). A client with no stored
+    state (fresh install, lost state file) accepts any correctly signed
+    pointer, including an older one. That's trust-on-first-use, bounded
+    by the retention policy.
+  - **The signing key** lets its holder publish anything to every node.
+    **The server age identity** lets its holder read every node's
+    WireGuard keys.
+
+  Keep both in the scheduler's secret store only, never on a node or in
+  an image, and treat exposure of either as a fleet compromise: rotate it
+  (§8) and run bare `--rotate`.
 - Keep the bucket private, with public endpoints/CDN access disabled.
-  Each client must receive distinct credentials permitting `GetObject`
-  only for `current.json` and its own `nodes/{hostname}/` prefix. The
-  server has read/write/list/delete permissions for the reserved namespace.
-  Bucket-wide client credentials would expose every private key and are
-  unsuitable for node isolation; random generation IDs do not fix this.
+  Each client should still receive distinct credentials permitting
+  `GetObject` only for `current.json` and its own `nodes/{hostname}/`
+  prefix. Under v2 this is defense in depth rather than the isolation
+  mechanism itself. It denies other nodes even the ciphertext and
+  shrinks what a leaked node credential exposes. The server has
+  read/write/list/delete permissions for the reserved namespace.
 - R2 supports scoped temporary credentials with exact-object and prefix
   restrictions. The out-of-band credential issuer grants `current.json`
   plus the node prefix, supplies the access key, secret key, and session
@@ -776,11 +1102,11 @@ is a new publication decision and still propagates on client schedules.
   token with `actions: ["GetObject"]`, `paths.objectPaths: ["current.json"]`,
   and `paths.prefixPaths: ["nodes/<hostname>/"]`. Broader object-read-only
   presets can also grant listing, which this client does not require.
-  A provider/deployment unable to enforce per-node reads requires a
-  different isolation mechanism before deployment; per-node encryption
-  remains a possible future mechanism rather than a v1 implementation.
-- The shared discovery object exposes fleet hostnames and content digests,
-  but no private keys or PSKs. Access to it is part of the client trust
+  A provider/deployment unable to enforce per-node reads can still run
+  schema v2 safely. Per-node encryption is the isolation mechanism; only
+  the defense-in-depth layer is lost.
+- The shared discovery object exposes fleet hostnames, content digests,
+  and recipient fingerprints, but no private keys or PSKs. Access to it is part of the client trust
   model; deployments requiring private fleet membership need a different
   discovery mechanism.
 - Both binaries validate `r2_config.endpoint` in their own configuration
@@ -794,27 +1120,29 @@ is a new publication decision and still propagates on client schedules.
   TLS-enabled test harness first. Until then, the SDK's own permissiveness
   for HTTP endpoints must not be relied on as a substitute
   ([SDK endpoint documentation](https://docs.aws.amazon.com/sdk-for-rust/latest/dg/endpoints.html)).
-- Both retained generations contain private keys; deletion or removal from
-  the current topology does not revoke previously downloaded keys or
-  storage credentials. Digests detect incomplete or corrupted downloads,
-  but do not authenticate content against someone who can replace both
-  the configurations and `current.json`.
-- Because reuse is read back from the bucket itself, anyone with
-  **write** access to the bucket could plant a malicious `.conf` for a
-  node ahead of an `apply` run and have `wg-server` treat its (attacker-
-  chosen) `PrivateKey` as legitimate to reuse. This is not a new exposure
-  in practice — anyone with write access to the bucket could simply upload
-  a malicious `.conf` directly and skip `wg-server` entirely — but it's
-  worth stating plainly: the read-write credentials in `--config` are the
-  actual trust boundary for the whole fleet, not `wg-server`'s logic.
+- Both retained generations contain private keys, encrypted. Deletion or
+  removal from the current topology does not revoke previously downloaded
+  keys, a node's own age identity (which can decrypt every file ever
+  addressed to it, including retained ones), or storage credentials.
+  Digests are covered by the pointer signature, so together they
+  authenticate content, not just detect corruption.
+- Because reuse is read back from the bucket itself, `wg-server` reuses a
+  `PrivateKey` only from a file it could decrypt with its own identity,
+  listed in a pointer whose signature verified against its own key. A
+  bucket writer without `publication_keys` therefore can't plant a
+  `.conf` that the server would reuse. Under schema v1 they could, and
+  the read-write credentials were the real trust boundary. Under v2,
+  `publication_keys` is.
 
 To remove a node, revoke its storage credentials and remove it from the
 topology/master list, then publish. Confirm remaining affected peers have
 applied the removal; publication alone does not revoke an offline peer's
 cached configuration. For urgent revocation, block the node at the host or
 network firewall while scheduled updates propagate. If bucket-wide client
-credentials were ever exposed, revoke them and treat the fleet's private
-keys and PSKs as compromised, requiring a controlled fleet rotation. The
+credentials were ever exposed, revoke them. Under v2 that alone isn't a
+key compromise: only ciphertext was readable. If the server age identity
+or the signing key was exposed, treat the fleet's private keys and PSKs as
+compromised, which requires a controlled fleet rotation. The
 previous generation's retained keys are secret recovery material,
 not authorization to reconnect a removed node.
 
@@ -827,7 +1155,8 @@ not authorization to reconnect a removed node.
 - `--dry-run` prints the planned publication and cleanup without writes,
   deletes, configuration bodies, or secret key material. A later real
   invocation re-reads state and computes its own plan.
-- Redact credential fields, private keys, PSKs, config bodies, SDK request
+- Redact credential fields, private keys, PSKs, age identities, the
+  signing key, plaintext and ciphertext config bodies, SDK request
   signing headers, and parser error values. Log field names, hostnames,
   generation IDs, digests, and sanitized error categories instead. Disable
   secret-bearing debug dumps and core dumps in the job environment.
@@ -842,7 +1171,10 @@ not authorization to reconnect a removed node.
 | `aws-sdk-s3`, `aws-config` | S3-compatible storage client, with custom endpoint + `auto`/path-style support for R2 |
 | `x25519-dalek`, `rand` | WireGuard-compatible key generation, PSKs, and 32-byte random generation IDs |
 | `base64` | WireGuard configuration key encoding |
-| `sha2` | SHA-256 digest computation over rendered configuration bytes |
+| `sha2` | SHA-256 digest computation over uploaded ciphertext bytes and recipient fingerprints |
+| `age` | age v1 file format (encrypt to two recipients, decrypt with server identities); the `mlkem768x25519` recipient/identity type itself lives in `wg-common` until upstream ships it (§10) |
+| `ml-kem`, `hpke` (via `wg-common`) | Building blocks for the `mlkem768x25519` type, mirroring the `age` crate's own `tagpq` module |
+| `ed25519-dalek` | Pointer signing (§10) |
 | `wg-common` (shared crate, §3) | Strict config parser/renderer and key validation shared with `wg-client`; wraps `ipnet`/`url` for typed route/endpoint validation and implements the canonical lowercase Crockford Base32 encoding for IDs/digests (§10) — both binaries call this one implementation rather than each reimplementing the encoding |
 | `thiserror` / `anyhow` | Error types |
 | `tracing`, `tracing-subscriber` | Logging |
@@ -853,7 +1185,11 @@ not authorization to reconnect a removed node.
   for idempotent retries, plus a documented maintenance/rollout policy.
 - Per-node scoped storage tokens generated and rotated by `wg-server`
   itself, if the provider exposes a token-management API.
-- Optional per-node encryption of `.conf` contents at rest.
+- Hybrid Ed25519 + ML-DSA-65 pointer signatures (both must verify),
+  rolled out through `server_verify_keys` the same way as a signing-key
+  rotation (§8, §10).
+- Switch `wg-common`'s `mlkem768x25519` implementation to the upstream
+  `age` crate's once released (§10).
 - IPv6 tunnel addresses / dual-stack `AllowedIPs`.
 - Webhook/notification on publish (e.g. notify a chat channel of topology
   changes).

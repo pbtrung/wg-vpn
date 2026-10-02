@@ -17,7 +17,8 @@ Status: design only, no implementation yet.
    local target path.
 2. Determines this node's own hostname.
 3. Reads `{bucket}/current.json`, verifies its signature against the
-   pinned server verify keys, and rejects a replayed older pointer. It
+   pinned server verify keys (hybrid Ed25519 + ML-DSA-87; both
+   signatures must verify), and rejects a replayed older pointer. It
    then downloads `nodes/{hostname}/{generation-id}.conf.age`, verifies
    its digest, and decrypts it with this node's own age identity (see
    [wg-server.md §10](./wg-server.md#10-upload-to-storage)).
@@ -128,7 +129,12 @@ process could have pre-created.
     "bucket": "wg-confs"
   },
   "age_identities": ["AGE-SECRET-KEY-PQ-1..."],
-  "server_verify_keys": ["<Base64 32-byte Ed25519 public key>"],
+  "server_verify_keys": [
+    {
+      "ed25519": "<Base64 32-byte Ed25519 public key>",
+      "ml_dsa_87": "<Base64 2592-byte ML-DSA-87 public key>"
+    }
+  ],
   "conf_path": "/etc/wireguard/wg0.conf"
 }
 ```
@@ -141,7 +147,7 @@ process could have pre-created.
 | `r2_config.region` | string | yes | `"auto"` for R2. |
 | `r2_config.bucket` | string | yes | Must match the bucket `wg-server` publishes to. |
 | `age_identities` | string[] | yes | 1–2 `mlkem768x25519` identities (`AGE-SECRET-KEY-PQ-1…`) for this node; every other type is rejected. Normally one. A second is present only while rotating the node's identity (wg-server.md §8 "Rotating publication keys"). Decryption tries each. These are secrets: the same file protections as the credentials apply. |
-| `server_verify_keys` | string[] | yes | 1–4 canonical Base64 32-byte Ed25519 public keys. A pointer is accepted if its signature verifies under **any** of them. More than one exists only during a signing-key rotation or a signature-algorithm upgrade. This is a trust anchor: provision it out of band, never from the bucket. |
+| `server_verify_keys` | object[] | yes | 1–4 entries. Each entry is one server signing pair, with exactly two fields: `ed25519` (canonical Base64, 32 bytes) and `ml_dsa_87` (canonical Base64, 2592 bytes). A pointer is accepted only when **both** its signatures verify under the **same** entry. Mixing halves from different entries is never accepted. More than one entry exists only during a signing-key rotation. This is a trust anchor: provision it out of band, never from the bucket. |
 | `conf_path` | string (path) | yes | Absolute installation path in a trusted root-owned directory. Filename must be `<iface>.conf` with a 1–15 character interface name (the Linux `IFNAMSIZ` limit) matching `[a-zA-Z0-9_=+.-]+`, excluding `.` and `..`. The stem is the interface name passed to netlink/UAPI calls and used for kernel checks and locking. |
 
 **`conf_path` is fixed across generations.** For example, each download
@@ -224,11 +230,11 @@ are not what brings the interface up in the first place after a reboot.
 
 With the interface reconciled from local state, discovery proceeds:
 
-1. Fetch `current.json`. Verify the envelope's Ed25519 signature over
-   `wg-vpn/current.json/v2\n` followed by the decoded payload bytes,
-   against each of `server_verify_keys`. Only then parse and validate the
-   payload (wg-server.md §10). A signature that verifies under none of
-   them, or an unsupported schema version (v1 included), is an error;
+1. Fetch `current.json`. Verify the envelope's Ed25519 and ML-DSA-87
+   signatures over `wg-vpn/current.json/v2\n` followed by the decoded
+   payload bytes. Both must verify under the same `server_verify_keys`
+   entry (wg-server.md §10). Only then parse and validate the payload. A
+   pointer that has no entry under which both signatures verify, or an unsupported schema version (v1 included), is an error;
    keep the existing tunnel unchanged.
 2. **Replay check.** Compare the payload's `sequence` with the highest
    one recorded in the state file, using integers only, never the local
@@ -764,7 +770,7 @@ host's resolver setup.
   Keep one backup only, and fsync files/directories as described in §6.
 - Validate the config even when its digest and signature are correct.
   With the pointer signed, the digest authenticates the file against a
-  bucket writer. Holders of the server's signing key can still publish
+  bucket writer. Holders of both of the server's signing keys can still publish
   anything, and the directive allowlist then still prevents downloaded
   hooks from becoming root shell commands.
 - Validate `r2_config.endpoint` in application code
@@ -794,8 +800,8 @@ host's resolver setup.
 | `hostname` | System hostname lookup |
 | `fd-lock` (or `fs2`) | `flock`-based single-instance guard |
 | `sha2` | SHA-256 digest computation over downloaded ciphertext (compared against the signed pointer), decrypted plaintext (compared against the persisted applied hash), and recipient fingerprints (§6) |
-| `age` (+ `wg-common`'s `mlkem768x25519` type) | Decrypting the node's configuration with its own identity (wg-server.md §10) |
-| `ed25519-dalek` | Verifying the pointer signature against `server_verify_keys` |
+| `age` (+ `wg-common`'s `mlkem768x25519` type, built on `libcrux-kem`'s X-Wing) | Decrypting the node's configuration with its own identity (wg-server.md §10) |
+| `ed25519-dalek`, `libcrux-ml-dsa` | Verifying both halves of the hybrid pointer signature against `server_verify_keys` |
 | `ipnet` | CIDR overlap checks against the live routing table during preflight (§6) — a client-specific use, separate from `wg-common`'s config-parsing use below |
 | `wireguard-control` (or equivalent netlink/UAPI crate) | In-process WireGuard device creation/configuration (private key, listen port, peers, `AllowedIPs`, keepalive) and interface address/route management via netlink — the same approach [innernet](https://github.com/tonarino/innernet) uses; replaces shelling out to `wg`/`wg-quick` (§6, §8) |
 | `wg-common` (shared crate, §3) | Strict config parser/validator, key validation, shared limits, and the canonical lowercase Crockford Base32 encoding for IDs/digests — the same implementation `wg-server` uses, so neither binary reimplements it independently |

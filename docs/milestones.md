@@ -554,12 +554,17 @@ the full topology/lifecycle suite to pass at completion; M5 adds chaos.
 - **Schema v2 cryptography** (M7):
   - The `mlkem768x25519` type round-trips with the Go reference
     implementation (`filippo.io/age`) in both directions, and matches
-    the spec's published vectors where available.
+    the spec's published vectors where available. libcrux's X-Wing
+    output also matches the X-Wing / concrete-hybrid-KEM test vectors.
+  - ML-DSA-87 signatures from `libcrux-ml-dsa` verify against an
+    independent implementation, and the reverse.
   - Readers reject files with a non-`mlkem768x25519` stanza, one or
     three stanzas, a truncated or tampered final chunk, or plaintext one
     byte over 1 MiB. No plaintext is written for any rejected file.
-  - Pointer checks reject: an edited payload under a valid signature, a
-    signature from an unpinned key, a v1 pointer without
+  - Pointer checks reject: an edited payload under valid signatures, a
+    signature from an unpinned key, a pointer with only one of its two
+    signatures valid (each half tested separately), halves that verify
+    under two different `server_verify_keys` entries, a v1 pointer without
     `--migrate-v1`, a v2 pointer with it, a lower `sequence`, and an
     equal `sequence` with a different payload.
   - A recipient-only topology change produces a new generation; an
@@ -612,7 +617,7 @@ correctness.
 | M4 — Kernel network harness | Rootful Docker fixtures, real interfaces, connectivity and host lifecycle | §4 topology/assertion and Lifecycle and host application suites passed; PR core required and full lifecycle scheduled nightly |
 | M5 — Full chaos matrix | Process kills, partitions, real transport response loss and writer races | §4 Chaos scenarios passed on the supported kernel/provider harness and scheduled nightly; deterministic failure cases remain M1–M3 gates |
 | M6 — Scheduled security and scale | Persisted fuzzing corpus, provider credential checks, reproducible benchmarks | §5 deterministic cases green, nightly fuzzing configured with no unresolved crashes, provider scoping checks passed, and §6 benchmark outcomes/baselines recorded; scale timings remain informational |
-| M7 — Encrypted, signed publication (schema v2) | `mlkem768x25519` age type in `wg-common`, two-recipient encryption, Ed25519-signed pointer with `sequence`, client replay check, `keygen`, `restore-previous`, `--migrate-v1` ([wg-server.md §10](./wg-server.md#encryption-and-signing-schema-v2)) | §5 "Schema v2 cryptography" cases green; `mlkem768x25519` interop with the Go reference implementation in both directions; `docker-tests/` runs on v2 end to end, plus tampered-file, forged/edited-pointer, replayed-pointer, and v1→v2 migration scenarios that leave the working tunnel up |
+| M7 — Encrypted, signed publication (schema v2) | `mlkem768x25519` age type in `wg-common`, two-recipient encryption, hybrid Ed25519 + ML-DSA-87 signed pointer with `sequence`, X-Wing via libcrux, client replay check, `keygen`, `restore-previous`, `--migrate-v1` ([wg-server.md §10](./wg-server.md#encryption-and-signing-schema-v2)) | §5 "Schema v2 cryptography" cases green; `mlkem768x25519` interop with the Go reference implementation in both directions; `docker-tests/` runs on v2 end to end, plus tampered-file, forged/edited-pointer, replayed-pointer, and v1→v2 migration scenarios that leave the working tunnel up |
 
 M7 is planned and not implemented yet; M0–M6 describe the current code.
 Milestones describe delivery scope; §8 defines ongoing CI frequency. M1

@@ -110,11 +110,12 @@ wg-server restore-previous --config <path> [--dry-run]
 parsing `publication_keys` and every `age_recipient`, with no network calls.
 
 `keygen` makes no network call and reads no config. It generates a fresh
-server age identity (`mlkem768x25519`) and a fresh Ed25519 signing key,
-and prints one JSON object to stdout. The object holds the
-`publication_keys` block for this config (§5), plus the derived
-`server_recipient` and `server_verify_key` for operators to distribute.
-`server_verify_key` goes into every client's `server_verify_keys` (see
+server age identity (`mlkem768x25519`) and a fresh hybrid signing key
+pair (Ed25519 + ML-DSA-87), and prints one JSON object to stdout. The
+object holds the `publication_keys` block for this config (§5), plus the
+derived `server_recipient` and `server_verify_key` for operators to
+distribute. `server_verify_key` is an object holding both public keys;
+it goes into every client's `server_verify_keys` (see
 [wg-client.md §4](./wg-client.md#4-client-configuration-schema)). Run it
 with a restrictive umask and redirect stdout straight into the secret
 store; it never writes a file itself.
@@ -158,7 +159,10 @@ same one-generation retention policy.
   "publication_keys": {
     "age_identity": "AGE-SECRET-KEY-PQ-1...",
     "retired_age_identities": [],
-    "signing_key": "<Base64 32-byte Ed25519 seed>"
+    "signing_keys": {
+      "ed25519": "<Base64 32-byte Ed25519 seed>",
+      "ml_dsa_87": "<Base64 32-byte ML-DSA-87 seed>"
+    }
   },
   "nodes": [
     {
@@ -201,7 +205,7 @@ same one-generation retention policy.
 | Field | Type | Required | Notes |
 |---|---|---|---|
 | `r2_config` | object | yes | Storage credentials — see below. |
-| `publication_keys` | object | yes | Server age identity and pointer-signing key — see below. |
+| `publication_keys` | object | yes | Server age identity and pointer-signing keys — see below. |
 | `nodes` | array | yes | See below. Each entry has `hostname`, `age_recipient`, and `wg_config`. |
 | `master` | string[] | yes | Hostnames of master nodes — see below. |
 
@@ -225,7 +229,13 @@ credentials (§12). `wg-server keygen` (§4) generates them.
 |---|---|---|---|
 | `age_identity` | string | yes | The server's own age identity: `AGE-SECRET-KEY-PQ-1…` (the `mlkem768x25519` type, §10). Every published file is also encrypted to its recipient, so the next `apply` can decrypt the current generation and reuse its keys (§8). |
 | `retired_age_identities` | string[] | no (default `[]`) | Earlier server identities. Used **only to decrypt** the current generation while the server identity is being rotated; never used to encrypt. At most 2 entries. Remove an entry once a run under the new identity has committed. |
-| `signing_key` | string | yes | Canonical Base64 of a 32-byte Ed25519 secret seed. Signs every `current.json` write (§10). Its public key is what clients pin as `server_verify_keys`. |
+| `signing_keys.ed25519` | string | yes | Canonical Base64 of a 32-byte Ed25519 secret seed (RFC 8032). |
+| `signing_keys.ml_dsa_87` | string | yes | Canonical Base64 of the 32-byte ML-DSA-87 key-generation seed ξ (FIPS 204 `ML-DSA.KeyGen_internal`). The expanded secret key is derived in memory and never stored. |
+
+The two signing keys always work as a pair. Every `current.json` write
+carries both signatures (§10), and the pair's two public keys together
+are what clients pin as one `server_verify_keys` entry. They are rotated
+together, never independently.
 
 ### `nodes[].age_recipient`
 
@@ -271,7 +281,8 @@ Run for both `apply` and `validate`, before any key handling or network call:
   another's file. Also reject any node recipient equal to the server's own.
 - `publication_keys.age_identity` and each `retired_age_identities` entry
   must parse as `mlkem768x25519` identities with distinct recipients.
-  `signing_key` must decode as canonical Base64 to exactly 32 bytes.
+  Each of `signing_keys.ed25519` and `signing_keys.ml_dsa_87` must decode
+  as canonical Base64 to exactly 32 bytes.
 - Hostnames must be unique across `nodes`.
 - `nodes` must be non-empty.
 - Every entry in `master` must reference an existing hostname in `nodes`,
@@ -367,8 +378,8 @@ every node's local LAN or changing DNS answers.
 ## 8. Key management
 
 `wg-server` keeps no local database or key store between runs. On every
-run it reads `current.json` and verifies its signature against its own
-`signing_key` (§10). It then gets reusable keys by decrypting the
+run it reads `current.json` and verifies both of its signatures against
+its own `signing_keys` (§10). It then gets reusable keys by decrypting the
 complete generation named by `current` with its own age identity (or a
 retired one, §5). The signed pointer and retained `.conf.age` objects are
 the only durable state; an interrupted job's memory or temporary files are
@@ -394,7 +405,7 @@ Abort and report the affected node. Only a new node or an explicit
 | Preshared key | 32 CSPRNG bytes, Base64 | one per **edge** (unordered pair) | reused from both endpoints' matching current stanzas if neither endpoint is rotating; otherwise generated once per edge |
 | Node age identity | `mlkem768x25519` (ML-KEM-768 + X25519 hybrid) | one per **node** | generated **on the node** (`wg-client keygen`); the server only ever sees its recipient (`nodes[].age_recipient`) and never generates, stores, or publishes it |
 | Server age identity | `mlkem768x25519` | one per **fleet** | `publication_keys.age_identity`, generated by `wg-server keygen` and supplied as a job secret |
-| Pointer signing key | Ed25519 | one per **fleet** | `publication_keys.signing_key`, generated by `wg-server keygen` and supplied as a job secret |
+| Pointer signing key pair | Ed25519 + ML-DSA-87 (hybrid; both signatures required) | one pair per **fleet** | `publication_keys.signing_keys`, generated by `wg-server keygen` and supplied as a job secret |
 
 The age and signing keys are long-lived configuration, not per-run key
 material. `--rotate` never touches them; rotating them is the staged,
@@ -470,14 +481,14 @@ None of these steps require fleet downtime. Each is a sequence of normal
   `previous` generation, which still names the old recipient. Removing it
   is what retires that copy from the server's view; the objects
   themselves go at the next cleanup that drops them.
-- **The signing key**:
-  1. Add the new verify key to every client's `server_verify_keys` and
-     wait until all clients have it.
-  2. Switch `signing_key` to the new value and run `apply`. Rotating the
-     signing key forces a pointer write but not a new generation.
-  3. Remove the old verify key from clients.
+- **The signing key pair** (both halves together):
+  1. Add the new verify-key entry to every client's `server_verify_keys`
+     and wait until all clients have it.
+  2. Switch `signing_keys` to the new pair and run `apply`. This forces a
+     pointer write but not a new generation.
+  3. Remove the old entry from clients.
 
-  Changing the signing key before every client trusts the new verify key
+  Changing the signing keys before every client trusts the new entry
   leaves those clients rejecting every pointer until they do. They fail
   closed: their tunnel stays up.
 - **Loss of the server age identity** with no retired copy means the
@@ -636,7 +647,10 @@ The stored object:
 {
   "schema_version": 2,
   "payload": "<canonical Base64 of the exact payload JSON bytes>",
-  "signature": "<canonical Base64 of a 64-byte Ed25519 signature>"
+  "signatures": {
+    "ed25519": "<canonical Base64 of a 64-byte Ed25519 signature>",
+    "ml_dsa_87": "<canonical Base64 of a 4627-byte ML-DSA-87 signature>"
+  }
 }
 ```
 
@@ -799,32 +813,61 @@ recipients, and this fleet makes that a hard rule.
   They are metadata, not an access control. Decryption is the access
   control.
 
-**The pointer** is signed with Ed25519 (`publication_keys.signing_key`).
-The signature covers the ASCII domain-separation prefix
+**The pointer** carries a hybrid signature: one Ed25519 signature and
+one ML-DSA-87 signature, made with `publication_keys.signing_keys`.
+Both sign the same message M: the ASCII domain-separation prefix
 `wg-vpn/current.json/v2\n` followed by the exact decoded payload bytes.
-Signing raw bytes avoids JSON canonicalization rules. Verification
-happens before the payload is parsed. Both the server (against its own
-key) and every client (against `server_verify_keys`) reject a pointer
-that doesn't verify. A configuration file's integrity follows from its
-SHA-256 digest in the signed payload. Files are not signed separately.
+Signing raw bytes avoids JSON canonicalization rules.
+- Ed25519 is plain RFC 8032 Ed25519 (not Ed25519ph/ctx).
+- ML-DSA-87 is FIPS 204 pure ML-DSA (not HashML-DSA), hedged signing,
+  and an empty context string. The domain prefix inside M already does
+  the context's job.
 
-Ed25519 is classical, not post-quantum. Signatures don't share the
-harvest-now-decrypt-later exposure that encryption has: a forgery must
-happen while the verify key is still trusted, not decades after
-recording. Upgrade to a hybrid Ed25519 + ML-DSA-65 signature (§15) before
-a cryptographically relevant quantum computer is a realistic threat.
-Pinning a list of verify keys, rather than one, is what makes that
-upgrade and routine signing-key rotation possible without a flag day
+A pointer is valid only when **both** signatures verify under the **same**
+`server_verify_keys` entry. A forgery then needs both a classical break of
+Ed25519 and a break of ML-DSA (for example, by a quantum computer, or
+through a flaw in this young scheme or its implementations). Accepting
+either signature alone would give up exactly that property, so neither
+reader does.
+
+ML-DSA-87 is FIPS 204's highest parameter set (NIST category 5). Its
+costs are negligible here: a 2592-byte public key in each client's
+config, and a 4627-byte signature on one small object per write. The
+encryption side stays at ML-KEM-768 (category 3), because `mlkem768x25519`
+is the only native post-quantum hybrid age type. Raising it would mean a
+non-standard age type that Go age couldn't decrypt, losing the interop
+check that gates the implementation.
+
+Verification happens before the payload is parsed. Both the server
+(against its own keys) and every client (against `server_verify_keys`)
+reject a pointer that doesn't verify. A configuration file's integrity
+follows from its SHA-256 digest in the signed payload. Files are not
+signed separately. Pinning a list of verify-key entries, rather than
+one, is what makes signing-key rotation possible without a flag day
 (§8).
 
 **Implementation status.** The Rust `age` crate (0.12.1, the latest
 release checked) supports the age file format and the hardware-token
 `mlkem768p256tag` type. It does not yet ship the software
 `mlkem768x25519` recipient/identity. Until it does, implement that type in
-`wg-common` against the `age` crate's public `Recipient`/`Identity` traits.
-Structure it like the crate's own `tagpq` module: the same `ml-kem` and
-`hpke` building blocks, with X25519 in place of P-256, following the HPKE
-`MLKEM768-X25519` KEM the C2SP spec references.
+`wg-common` against the `age` crate's public `Recipient`/`Identity` traits,
+using [libcrux](https://github.com/cryspen/libcrux)'s X-Wing as the KEM.
+
+The age spec's KEM is HPKE `MLKEM768-X25519` (KEM ID `0x647a`,
+draft-ietf-hpke-pq). draft-irtf-cfrg-concrete-hybrid-kems defines that KEM
+and states it "is identical to the X-Wing construction". The parameters
+match what libcrux-kem implements as `XWingKemDraft06`:
+- 32-byte private seed, expanded with SHAKE-256 into the ML-KEM-768 and
+  X25519 keys;
+- 1216-byte public key and 1120-byte encapsulation;
+- SHA3-256 combiner with the `\.//^\` label.
+
+So the only custom code is the glue: the HPKE base-mode layer, through
+the `hpke` crate's KEM trait the same way the `age` crate's own `tagpq`
+module plugs in its KEM; the age stanza encoding; and the
+`age1pq1…`/`AGE-SECRET-KEY-PQ-1…` encodings. No hand-assembled ML-KEM or
+X25519 combination. The ML-KEM inside libcrux is formally verified (hax);
+treat the X-Wing combiner and HPKE glue as ordinary, test-gated code.
 
 Do not treat this module as trusted until it passes both checks:
 - it decrypts files produced by the Go reference implementation
@@ -1068,7 +1111,7 @@ is a new publication decision and still propagates on client schedules.
   trust boundary; `publication_keys` is. Concretely:
   - **Read access** to the bucket reveals hostnames, digests, recipient
     fingerprints, generation IDs, and ciphertext — no private key or PSK.
-  - **Write access** without the signing key can delete objects or upload
+  - **Write access** without the signing keys can delete objects or upload
     junk (denial of service). It cannot plant a configuration any client
     or the server will accept: a forged or edited pointer fails signature
     verification, and a file swapped under a valid pointer fails its
@@ -1078,7 +1121,9 @@ is a new publication decision and still propagates on client schedules.
     state (fresh install, lost state file) accepts any correctly signed
     pointer, including an older one. That's trust-on-first-use, bounded
     by the retention policy.
-  - **The signing key** lets its holder publish anything to every node.
+  - **The signing key pair** lets its holder publish anything to every
+    node. Both halves are needed: one leaked half alone forges nothing,
+    but rotate the pair anyway.
     **The server age identity** lets its holder read every node's
     WireGuard keys.
 
@@ -1141,7 +1186,7 @@ cached configuration. For urgent revocation, block the node at the host or
 network firewall while scheduled updates propagate. If bucket-wide client
 credentials were ever exposed, revoke them. Under v2 that alone isn't a
 key compromise: only ciphertext was readable. If the server age identity
-or the signing key was exposed, treat the fleet's private keys and PSKs as
+or both signing keys were exposed, treat the fleet's private keys and PSKs as
 compromised, which requires a controlled fleet rotation. The
 previous generation's retained keys are secret recovery material,
 not authorization to reconnect a removed node.
@@ -1156,7 +1201,7 @@ not authorization to reconnect a removed node.
   deletes, configuration bodies, or secret key material. A later real
   invocation re-reads state and computes its own plan.
 - Redact credential fields, private keys, PSKs, age identities, the
-  signing key, plaintext and ciphertext config bodies, SDK request
+  signing keys, plaintext and ciphertext config bodies, SDK request
   signing headers, and parser error values. Log field names, hostnames,
   generation IDs, digests, and sanitized error categories instead. Disable
   secret-bearing debug dumps and core dumps in the job environment.
@@ -1173,8 +1218,10 @@ not authorization to reconnect a removed node.
 | `base64` | WireGuard configuration key encoding |
 | `sha2` | SHA-256 digest computation over uploaded ciphertext bytes and recipient fingerprints |
 | `age` | age v1 file format (encrypt to two recipients, decrypt with server identities); the `mlkem768x25519` recipient/identity type itself lives in `wg-common` until upstream ships it (§10) |
-| `ml-kem`, `hpke` (via `wg-common`) | Building blocks for the `mlkem768x25519` type, mirroring the `age` crate's own `tagpq` module |
-| `ed25519-dalek` | Pointer signing (§10) |
+| `libcrux-kem` (via `wg-common`) | X-Wing (`XWingKemDraft06`), the KEM inside the `mlkem768x25519` age type (§10) |
+| `hpke` (via `wg-common`) | HPKE base mode around X-Wing, plugged in the same way the `age` crate's `tagpq` module does |
+| `ed25519-dalek` | Ed25519 half of the hybrid pointer signature (§10) |
+| `libcrux-ml-dsa` | ML-DSA-87 half of the hybrid pointer signature (§10); formally verified arithmetic (hax) |
 | `wg-common` (shared crate, §3) | Strict config parser/renderer and key validation shared with `wg-client`; wraps `ipnet`/`url` for typed route/endpoint validation and implements the canonical lowercase Crockford Base32 encoding for IDs/digests (§10) — both binaries call this one implementation rather than each reimplementing the encoding |
 | `thiserror` / `anyhow` | Error types |
 | `tracing`, `tracing-subscriber` | Logging |
@@ -1185,9 +1232,6 @@ not authorization to reconnect a removed node.
   for idempotent retries, plus a documented maintenance/rollout policy.
 - Per-node scoped storage tokens generated and rotated by `wg-server`
   itself, if the provider exposes a token-management API.
-- Hybrid Ed25519 + ML-DSA-65 pointer signatures (both must verify),
-  rolled out through `server_verify_keys` the same way as a signing-key
-  rotation (§8, §10).
 - Switch `wg-common`'s `mlkem768x25519` implementation to the upstream
   `age` crate's once released (§10).
 - IPv6 tunnel addresses / dual-stack `AllowedIPs`.
